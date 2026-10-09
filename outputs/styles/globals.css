@@ -1,0 +1,83 @@
+/* Ensure system font stack loads correctly */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  @apply box-border;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-paper text-text-primary font-sans;
+}
+
+/* Typography */
+h1 {
+  @apply text-h1 font-serif font-semibold;
+}
+
+h2 {
+  @apply text-h2 font-serif font-semibold;
+}
+
+h3 {
+  @apply text-h3 font-serif font-semibold;
+}
+
+p {
+  @apply text-body;
+}
+
+/* Links */
+a {
+  @apply text-green-dark transition-colors;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: none;
+}
+
+/* Form inputs base styling */
+input,
+textarea,
+select {
+  @apply font-sans text-body;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-paper;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-border rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-text-muted;
+}
+
+/* Focus states for accessibility */
+*:focus-visible {
+  @apply outline-green-dark outline-2 outline-offset-2;
+}
+
+/* Utility classes */
+.container-max {
+  @apply max-w-container mx-auto px-sm;
+}
+
+.gradient-border {
+  @apply border-l-4 border-l-green-dark;
+}
