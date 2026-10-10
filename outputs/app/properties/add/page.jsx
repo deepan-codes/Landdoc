@@ -1,26 +1,40 @@
 'use client';
 
-import { useState } from 'react';
+import { Suspense, useState, useEffect } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { properties } from '@/mockData';
 
-export default function AddPropertyPage() {
+function AddPropertyForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const editId = searchParams ? searchParams.get('edit') : null;
+  const existingProp = editId ? properties.find((p) => p.id === editId) : null;
 
   // Form State
-  const [propertyName, setPropertyName] = useState('Avadi Land');
-  const [location, setLocation] = useState('Avadi, Chennai');
+  const [propertyName, setPropertyName] = useState(existingProp ? existingProp.name : 'Avadi Land');
+  const [location, setLocation] = useState(existingProp ? existingProp.location : 'Avadi, Chennai');
   const [ownerName, setOwnerName] = useState('Sundaram V.');
-  const [pattaNumber, setPattaNumber] = useState('1845');
+  const [pattaNumber, setPattaNumber] = useState(existingProp?.pattaNumber || '1845');
   const [notes, setNotes] = useState(
     'Canara Bank safe locker custody, inherited through 1974 settlement deed, original parent documents preserved in steel trunk at native home...'
   );
 
   // Survey Numbers & Sub-Divisions State
-  const [surveys, setSurveys] = useState([
-    { id: '1', number: '25', subdivisions: ['25/1A', '25/1B', '25/2A'] },
-    { id: '2', number: '26', subdivisions: ['26/1'] },
-  ]);
+  const [surveys, setSurveys] = useState(
+    existingProp
+      ? [
+          {
+            id: '1',
+            number: existingProp.surveyNumber,
+            subdivisions: existingProp.subdivisions || [],
+          },
+        ]
+      : [
+          { id: '1', number: '25', subdivisions: ['25/1A', '25/1B', '25/2A'] },
+          { id: '2', number: '26', subdivisions: ['26/1'] },
+        ]
+  );
 
   // Adding new survey state
   const [isAddingSurvey, setIsAddingSurvey] = useState(false);
@@ -128,8 +142,8 @@ export default function AddPropertyPage() {
     setErrors({});
     setIsSubmitted(true);
     setTimeout(() => {
-      router.push('/');
-    }, 1200);
+      router.push(existingProp ? `/properties/${existingProp.id}` : '/properties');
+    }, 800);
   };
 
   return (
@@ -156,10 +170,12 @@ export default function AddPropertyPage() {
 
       {/* Main Title & Subtitle */}
       <h1 className="text-3xl sm:text-4xl font-serif text-text-primary font-normal leading-tight mb-2">
-        Add a property
+        {existingProp ? 'Edit property details' : 'Add a property'}
       </h1>
       <p className="text-sm sm:text-base text-text-muted mb-6 sm:mb-8">
-        Create a private archival folder for a land parcel or family home.
+        {existingProp
+          ? `Update recorded parcel boundaries, patta registration, and safekeeping folio for ${existingProp.name}.`
+          : 'Create a private archival folder for a land parcel or family home.'}
       </p>
 
       {/* Success Notification */}
@@ -571,5 +587,13 @@ export default function AddPropertyPage() {
         </div>
       </form>
     </div>
+  );
+}
+
+export default function AddPropertyPage() {
+  return (
+    <Suspense fallback={<div className="p-8 text-center text-text-muted">Loading property form...</div>}>
+      <AddPropertyForm />
+    </Suspense>
   );
 }
