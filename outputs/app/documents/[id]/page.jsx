@@ -2,12 +2,14 @@
 
 import { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
-import { notFound } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import { documents as mockDocuments, properties as mockProperties, documentDetails as defaultDetails } from '@/mockData';
-import { getDocument, getProperty } from '@/lib/db';
+import { getDocument, getProperty, updateDocument, deleteDocument } from '@/lib/db';
 
 export default function DocumentDetailPage({ params }) {
+  const router = useRouter();
   const docId = params?.id;
+
   const [loadedDoc, setLoadedDoc] = useState(null);
   const [loadedProperty, setLoadedProperty] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -15,6 +17,22 @@ export default function DocumentDetailPage({ params }) {
   const [copiedHash, setCopiedHash] = useState(false);
   const [blobUrl, setBlobUrl] = useState(null);
   const blobUrlRef = useRef(null);
+
+  // Edit modal state
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [editTitle, setEditTitle] = useState('');
+  const [editType, setEditType] = useState('Registered Sale Deed');
+  const [editNumber, setEditNumber] = useState('');
+  const [editSurvey, setEditSurvey] = useState('');
+  const [editNotes, setEditNotes] = useState('');
+  const [editImportant, setEditImportant] = useState(false);
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
+  const [editError, setEditError] = useState(null);
+
+  // Delete modal state
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isOcrExpanded, setIsOcrExpanded] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -94,6 +112,8 @@ export default function DocumentDetailPage({ params }) {
     surveyNumber: baseDoc?.surveyNumber || property?.surveyNumber || defaultDetails.surveyNumber,
     notes: baseDoc?.notes || defaultDetails.notes,
     description: baseDoc?.description || baseDoc?.notes || defaultDetails.notes,
+    rawText: baseDoc?.rawText || baseDoc?.ocrText || '',
+    ocrText: baseDoc?.ocrText || baseDoc?.rawText || '',
   };
 
   const totalPages = doc.pages || 4;
@@ -114,6 +134,92 @@ export default function DocumentDetailPage({ params }) {
       document.body.removeChild(a);
     } else {
       alert('Exporting encrypted copy to local disk...');
+    }
+  };
+
+  // Open Edit Modal with current values
+  const handleOpenEdit = () => {
+    setEditTitle(doc.name || '');
+    setEditType(doc.type || 'Registered Sale Deed');
+    setEditNumber(doc.docNumber || '');
+    setEditSurvey(doc.surveyNumber || '');
+    setEditNotes(doc.notes || '');
+    setEditImportant(Boolean(doc.isImportant || doc.isKey));
+    setEditError(null);
+    setIsEditModalOpen(true);
+  };
+
+  // Save Edit to IndexedDB
+  const handleSaveEdit = async (e) => {
+    e.preventDefault();
+    if (!editTitle.trim()) {
+      setEditError('Document title is required.');
+      return;
+    }
+
+    setIsSavingEdit(true);
+    setEditError(null);
+
+    try {
+      const updates = {
+        name: editTitle.trim(),
+        title: editTitle.trim(),
+        documentType: editType,
+        type: editType,
+        documentNumber: editNumber.trim(),
+        docNumber: editNumber.trim(),
+        surveyNumber: editSurvey.trim(),
+        notes: editNotes.trim(),
+        description: editNotes.trim(),
+        isImportant: Boolean(editImportant),
+        isKey: Boolean(editImportant),
+      };
+
+      // Check if document exists in IndexedDB before updating
+      if (baseDoc?.id) {
+        try {
+          await updateDocument(baseDoc.id, updates);
+        } catch (dbErr) {
+          console.warn('Note on DB update:', dbErr);
+        }
+      }
+
+      setLoadedDoc((prev) => ({ ...prev, ...updates }));
+      setIsEditModalOpen(false);
+    } catch (err) {
+      console.error('Failed to update document:', err);
+      setEditError(err.message || 'Failed to update document record.');
+    } finally {
+      setIsSavingEdit(false);
+    }
+  };
+
+  // Delete Document from IndexedDB
+  const handleConfirmDelete = async () => {
+    if (isDeleting) return;
+    setIsDeleting(true);
+
+    try {
+      if (baseDoc?.id) {
+        try {
+          await deleteDocument(baseDoc.id);
+        } catch (dbErr) {
+          console.warn('Note on DB deletion:', dbErr);
+        }
+      }
+
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
+      }
+
+      // Redirect to property folio or documents ledger
+      const redirectUrl = property?.id ? `/properties/${property.id}` : '/documents';
+      router.push(redirectUrl);
+    } catch (err) {
+      console.error('Failed to delete document:', err);
+      alert(err.message || 'Failed to delete document from vault.');
+      setIsDeleting(false);
     }
   };
 
@@ -150,7 +256,7 @@ export default function DocumentDetailPage({ params }) {
             <span className="px-2.5 py-0.5 text-xs font-semibold bg-stone-100 text-text-primary rounded-full border border-border">
               {doc.type}
             </span>
-            {doc.isImportant && (
+            {(doc.isImportant || doc.isKey) && (
               <span className="px-2.5 py-0.5 text-xs font-semibold bg-[#FDF6ED] text-[#8C5E28] rounded-full border border-[#F3E2CF]">
                 ★ Key Document
               </span>
@@ -166,18 +272,45 @@ export default function DocumentDetailPage({ params }) {
           </p>
         </div>
 
-        {/* Action Buttons */}
+        {/* Action Buttons: Download, Edit, Delete, Add Another */}
         <div className="flex flex-wrap items-center gap-2 self-start md:self-auto">
+          {/* Download Button */}
           <button
             type="button"
             onClick={handleDownload}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-white border border-border text-xs sm:text-sm font-medium text-text-primary rounded-button hover:bg-stone-50 transition-colors shadow-2xs"
+            className="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-border text-xs sm:text-sm font-medium text-text-primary rounded-button hover:bg-stone-50 transition-colors shadow-2xs"
           >
             <svg className="w-4 h-4 text-text-muted" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
             </svg>
             <span>{baseDoc?.fileBlob ? 'Download File' : 'Download PDF'}</span>
           </button>
+
+          {/* Edit Record Button */}
+          <button
+            type="button"
+            onClick={handleOpenEdit}
+            className="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-border text-xs sm:text-sm font-medium text-text-primary rounded-button hover:bg-stone-50 transition-colors shadow-2xs"
+          >
+            <svg className="w-4 h-4 text-text-muted" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125M18 14v4.75A2.25 2.25 0 0115.75 21H5.25A2.25 2.25 0 013 18.75V8.25A2.25 2.25 0 015.25 6H10" />
+            </svg>
+            <span>Edit record</span>
+          </button>
+
+          {/* Delete Button */}
+          <button
+            type="button"
+            onClick={() => setIsDeleteModalOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-red-200 text-xs sm:text-sm font-medium text-red-600 rounded-button hover:bg-red-50 hover:border-red-300 transition-colors shadow-2xs"
+          >
+            <svg className="w-4 h-4 text-red-500" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+            </svg>
+            <span>Delete</span>
+          </button>
+
+          {/* Add Another Document */}
           <Link
             href={`/documents/add?propertyId=${property?.id || ''}`}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-green-dark text-white text-xs sm:text-sm font-medium rounded-button hover:bg-[#134e3b] transition-colors shadow-2xs"
@@ -185,7 +318,7 @@ export default function DocumentDetailPage({ params }) {
             <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
             </svg>
-            <span>Add another document</span>
+            <span>Add document</span>
           </Link>
         </div>
       </div>
@@ -314,7 +447,7 @@ export default function DocumentDetailPage({ params }) {
         {/* Right Column: Key Folio Details & Physical Locker Info (5 cols) */}
         <div className="lg:col-span-5 space-y-6">
           {/* Registration & Legal Details */}
-          <div className="bg-white border border-border rounded-xl p-5 sm:p-6 space-y-4">
+          <div className="bg-white border border-border rounded-xl p-5 sm:p-6 space-y-4 shadow-xs">
             <h3 className="text-base font-serif font-bold text-text-primary">
               Registration & Folio
             </h3>
@@ -339,7 +472,7 @@ export default function DocumentDetailPage({ params }) {
           </div>
 
           {/* Cryptographic Vault Integrity */}
-          <div className="bg-white border border-border rounded-xl p-5 sm:p-6 space-y-3">
+          <div className="bg-white border border-border rounded-xl p-5 sm:p-6 space-y-3 shadow-xs">
             <h3 className="text-base font-serif font-bold text-text-primary">
               Vault File Integrity
             </h3>
@@ -364,8 +497,236 @@ export default function DocumentDetailPage({ params }) {
               </p>
             </div>
           </div>
+
+          {/* Recognized OCR Text Inspection */}
+          {(doc.rawText || doc.ocrText) && (
+            <div className="bg-white border border-border rounded-xl p-5 sm:p-6 space-y-3 shadow-xs">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                  <h3 className="text-base font-serif font-bold text-text-primary">
+                    Recognized Text (Local OCR)
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsOcrExpanded(!isOcrExpanded)}
+                  className="text-xs text-green-dark hover:underline font-medium"
+                >
+                  {isOcrExpanded ? 'Hide' : 'Inspect'}
+                </button>
+              </div>
+              {isOcrExpanded && (
+                <pre className="bg-[#FAF9F5] border border-border rounded-lg p-3 text-xs font-mono text-stone-800 max-h-60 overflow-y-auto whitespace-pre-wrap leading-relaxed select-all">
+                  {doc.rawText || doc.ocrText}
+                </pre>
+              )}
+            </div>
+          )}
         </div>
       </div>
+
+      {/* =========================================================================
+          EDIT RECORD MODAL
+          ========================================================================= */}
+      {isEditModalOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto"
+          onClick={() => setIsEditModalOpen(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-border space-y-5 my-8 text-text-primary"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-border pb-3">
+              <div>
+                <h3 className="font-serif font-bold text-lg text-text-primary">Edit Document Record</h3>
+                <p className="text-xs text-text-muted mt-0.5">Update metadata in your local vault index</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsEditModalOpen(false)}
+                className="text-text-muted hover:text-text-primary p-1 text-sm font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            {editError && (
+              <div className="bg-red-50 border border-red-200 text-red-800 rounded-lg p-3 text-xs">
+                {editError}
+              </div>
+            )}
+
+            <form onSubmit={handleSaveEdit} className="space-y-4 text-xs">
+              {/* Document Title */}
+              <div>
+                <label className="block font-semibold uppercase tracking-wider mb-1.5 text-text-primary">
+                  Document Title <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                  className="w-full px-3 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                />
+              </div>
+
+              {/* Document Type */}
+              <div>
+                <label className="block font-semibold uppercase tracking-wider mb-1.5 text-text-primary">
+                  Document Category <span className="text-red-500">*</span>
+                </label>
+                <select
+                  value={editType}
+                  onChange={(e) => setEditType(e.target.value)}
+                  className="w-full px-3 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                >
+                  <option value="Registered Sale Deed">Registered Sale Deed</option>
+                  <option value="Patta / Chitta Extract">Patta / Chitta Extract</option>
+                  <option value="Encumbrance Certificate (EC)">Encumbrance Certificate (EC)</option>
+                  <option value="Property Tax Receipt">Property Tax Receipt</option>
+                  <option value="Field Measurement Book (FMB)">Field Measurement Book (FMB)</option>
+                  <option value="Settlement / Partition Deed">Settlement / Partition Deed</option>
+                  <option value="Layout Approval / Order">Layout Approval / Order</option>
+                  <option value="Power of Attorney">Power of Attorney</option>
+                  <option value="Other Legal Document">Other Legal Document</option>
+                </select>
+              </div>
+
+              {/* Document Number */}
+              <div>
+                <label className="block font-semibold uppercase tracking-wider mb-1.5 text-text-primary">
+                  Document Number <span className="text-text-muted font-normal lowercase">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={editNumber}
+                  onChange={(e) => setEditNumber(e.target.value)}
+                  placeholder="e.g. Doc No. 412/1998"
+                  className="w-full px-3 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                />
+              </div>
+
+              {/* Survey Number */}
+              <div>
+                <label className="block font-semibold uppercase tracking-wider mb-1.5 text-text-primary">
+                  Survey Number / Sub-division <span className="text-text-muted font-normal lowercase">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={editSurvey}
+                  onChange={(e) => setEditSurvey(e.target.value)}
+                  placeholder="e.g. 25/1A"
+                  className="w-full px-3 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                />
+              </div>
+
+              {/* Notes */}
+              <div>
+                <label className="block font-semibold uppercase tracking-wider mb-1.5 text-text-primary">
+                  Archival Notes & Safekeeping <span className="text-text-muted font-normal lowercase">(optional)</span>
+                </label>
+                <textarea
+                  rows={2}
+                  value={editNotes}
+                  onChange={(e) => setEditNotes(e.target.value)}
+                  placeholder="e.g. Canara Bank Safe Locker #418"
+                  className="w-full px-3 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                />
+              </div>
+
+              {/* Key Document Toggle */}
+              <div>
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={editImportant}
+                    onChange={(e) => setEditImportant(e.target.checked)}
+                    className="h-4 w-4 rounded border-border text-green-dark focus:ring-green-dark"
+                  />
+                  <span className="font-semibold text-text-primary">Mark as Key Document in Portfolio</span>
+                </label>
+              </div>
+
+              {/* Modal Buttons */}
+              <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-border">
+                <button
+                  type="button"
+                  onClick={() => setIsEditModalOpen(false)}
+                  className="px-4 py-2 border border-border rounded-lg text-text-primary hover:bg-stone-50 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingEdit}
+                  className="px-5 py-2 bg-green-dark text-white font-semibold rounded-lg hover:bg-[#134e3b] transition-colors disabled:opacity-50"
+                >
+                  {isSavingEdit ? 'Saving...' : 'Save Changes'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* =========================================================================
+          DELETE CONFIRMATION MODAL
+          ========================================================================= */}
+      {isDeleteModalOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setIsDeleteModalOpen(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-border space-y-4 text-text-primary"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-red-100 text-red-600 flex items-center justify-center flex-shrink-0">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="font-serif font-bold text-base text-text-primary">Delete Document?</h3>
+                <p className="text-xs text-text-muted mt-0.5">This action permanently removes the record from this device.</p>
+              </div>
+            </div>
+
+            <div className="bg-[#FAF9F5] border border-border rounded-lg p-3 text-xs space-y-1">
+              <p><strong>Title:</strong> {doc.name}</p>
+              <p className="text-text-muted"><strong>Property:</strong> {property?.name || 'Vault'}</p>
+              {doc.surveyNumber && <p className="text-text-muted"><strong>Survey:</strong> {doc.surveyNumber}</p>}
+            </div>
+
+            <p className="text-xs text-stone-600 leading-relaxed">
+              Are you sure you want to delete this document and its encrypted binary file? This cannot be undone.
+            </p>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setIsDeleteModalOpen(false)}
+                disabled={isDeleting}
+                className="px-4 py-2 border border-border rounded-lg text-xs font-medium text-text-primary hover:bg-stone-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                disabled={isDeleting}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {isDeleting ? 'Deleting...' : 'Delete Document'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

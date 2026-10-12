@@ -10,13 +10,15 @@
     "lint": "next lint",
     "format": "prettier --write .",
     "type-check": "tsc --noEmit",
-    "test": "node scripts/test-db.mjs"
+    "test": "node scripts/test-db.mjs && node scripts/test-add-document.mjs && node scripts/test-global-search.mjs && node scripts/test-ocr.mjs"
   },
   "dependencies": {
     "idb": "^8.0.4",
     "next": "^14.0.0",
+    "pdfjs-dist": "^6.4.299",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "autoprefixer": "^10.4.16",

@@ -5,6 +5,8 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { properties as mockProperties } from '@/mockData';
 import { getAllProperties, getProperty, addDocument } from '@/lib/db';
+import { extractDocumentText, cancelOcr } from '@/lib/ocr';
+import { savePendingDraft } from '@/lib/draft';
 
 function AddDocumentContent() {
   const router = useRouter();
@@ -33,6 +35,18 @@ function AddDocumentContent() {
   const [surveyNumber, setSurveyNumber] = useState('');
   const [notes, setNotes] = useState('');
   const [isImportant, setIsImportant] = useState(false);
+
+  // Local OCR State
+  const [ocrLanguage, setOcrLanguage] = useState('eng'); // 'eng', 'eng+tam', 'tam'
+  const [autoExtract, setAutoExtract] = useState(true);
+  const [isOcrRunning, setIsOcrRunning] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState({ percent: 0, message: '', stage: '' });
+  const [ocrResult, setOcrResult] = useState(null);
+  const [ocrError, setOcrError] = useState(null);
+  const [isRawTextExpanded, setIsRawTextExpanded] = useState(false);
+  const [copiedRawText, setCopiedRawText] = useState(false);
+  const [extractedFieldFlags, setExtractedFieldFlags] = useState({});
+  const [isNavigatingReview, setIsNavigatingReview] = useState(false);
 
   // Submission & feedback state
   const [formError, setFormError] = useState(null);
@@ -220,6 +234,13 @@ function AddDocumentContent() {
     } else {
       setFilePreview(null);
     }
+
+    // Auto-trigger OCR extraction upon file selection if enabled
+    if (autoExtract) {
+      setTimeout(() => {
+        handleRunOcr(file);
+      }, 50);
+    }
   };
 
   const handleFileInputChange = (e) => {
@@ -301,10 +322,134 @@ function AddDocumentContent() {
     setSelectedFile(null);
     setRawFile(null);
     setFilePreview(null);
-    setFileError(null);
+    setOcrResult(null);
+    setOcrError(null);
+    setIsOcrRunning(false);
+    setExtractedFieldFlags({});
     setFormError(null);
+    setFileError(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
     if (cameraInputRef.current) cameraInputRef.current.value = '';
+  };
+
+  // Run local OCR on the currently selected document file
+  const handleRunOcr = async () => {
+    if (!rawFile) {
+      setFileError('Please select or scan a document file first.');
+      return;
+    }
+
+    setIsOcrRunning(true);
+    setOcrError(null);
+    setOcrProgress({ percent: 5, message: 'Initializing local OCR engine...', stage: 'start' });
+
+    try {
+      const result = await extractDocumentText(rawFile, {
+        language: ocrLanguage,
+        onProgress: (prog) => {
+          setOcrProgress({
+            percent: prog.percent || 0,
+            message: prog.message || 'Extracting...',
+            stage: prog.stage || 'running',
+          });
+        },
+      });
+
+      if (result.cancelled) {
+        setIsOcrRunning(false);
+        return;
+      }
+
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to extract text from document.');
+      }
+
+      setOcrResult(result);
+
+      // Pre-fill fields with suggestions
+      const suggestions = result.suggestions || {};
+      const newFlags = {};
+
+      if (suggestions.title) {
+        setDocName(suggestions.title);
+        newFlags.title = true;
+      }
+      if (suggestions.documentType) {
+        setDocType(suggestions.documentType);
+        newFlags.type = true;
+      }
+      if (suggestions.documentNumber) {
+        setDocNumber(suggestions.documentNumber);
+        newFlags.docNumber = true;
+      }
+      if (suggestions.surveyNumber) {
+        setSurveyNumber(suggestions.surveyNumber);
+        newFlags.survey = true;
+      }
+      if (suggestions.notes) {
+        setNotes((prev) => (prev ? `${prev} • ${suggestions.notes}` : suggestions.notes));
+        newFlags.notes = true;
+      }
+
+      setExtractedFieldFlags(newFlags);
+    } catch (err) {
+      console.error('OCR Error:', err);
+      setOcrError(err.message || 'Failed to extract text using local OCR.');
+    } finally {
+      setIsOcrRunning(false);
+    }
+  };
+
+  // Cancel running OCR worker
+  const handleCancelOcr = async () => {
+    await cancelOcr();
+    setIsOcrRunning(false);
+    setOcrProgress({ percent: 0, message: 'Text extraction was cancelled.', stage: 'cancelled' });
+  };
+
+  // Navigate to side-by-side Review page with pending draft
+  const handleProceedToReview = async () => {
+    if (!selectedProperty) {
+      setFormError('Please select a target property before proceeding.');
+      return;
+    }
+    if (!rawFile || !selectedFile) {
+      setFileError('Please select a file to review.');
+      return;
+    }
+
+    setIsNavigatingReview(true);
+    try {
+      await savePendingDraft({
+        propertyId: String(selectedProperty.id),
+        propertyName: selectedProperty.name,
+        fileBlob: rawFile,
+        fileName: rawFile.name || selectedFile.name,
+        fileSize: selectedFile.size,
+        fileType: rawFile.type || selectedFile.type,
+        filePreview: filePreview,
+        docTitle: docName,
+        docCategory: docType,
+        docNumber: docNumber,
+        surveyDetail: surveyNumber,
+        notes: notes,
+        isImportant: isImportant,
+        rawText: ocrResult?.rawText || '',
+        ocrText: ocrResult?.rawText || '',
+        suggestions: ocrResult?.suggestions || null,
+        extractedFlags: extractedFieldFlags,
+      });
+
+      router.push(
+        `/documents/review?propertyId=${selectedProperty.id}&fileName=${encodeURIComponent(
+          selectedFile.name
+        )}&fileSize=${encodeURIComponent(selectedFile.size)}`
+      );
+    } catch (err) {
+      console.error('Failed to prepare review draft:', err);
+      setIsNavigatingReview(false);
+      setFormError('Unable to open review page. You can save directly using the button below.');
+    }
   };
 
   // Save document to IndexedDB
@@ -353,6 +498,9 @@ function AddDocumentContent() {
         fileName: rawFile.name || selectedFile.name,
         fileSize: selectedFile.size,
         fileType: rawFile.type || selectedFile.type,
+        rawText: ocrResult?.rawText || '',
+        ocrText: ocrResult?.rawText || '',
+        extractedMetadata: ocrResult?.suggestions || null,
         dateAdded: new Date().toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' }),
       };
 
@@ -687,6 +835,208 @@ function AddDocumentContent() {
             </div>
           )}
 
+          {/* Local Optical Character Recognition (OCR) Panel */}
+          <div className="bg-[#FAF9F5] border border-border rounded-xl p-5 sm:p-6 shadow-xs space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-border/80 pb-3.5">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-emerald-100/80 text-emerald-800 flex items-center justify-center flex-shrink-0">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 4.875c0-.621.504-1.125 1.125-1.125h4.5m8.25 0h4.5c.621 0 1.125.504 1.125 1.125v4.5m0 8.25v4.5c0 .621-.504 1.125-1.125 1.125h-4.5m-8.25 0h-4.5A1.125 1.125 0 013.75 19.5v-4.5M9 12h6" />
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="font-serif font-bold text-sm sm:text-base text-text-primary">
+                    Local Document OCR & Field Extraction
+                  </h3>
+                  <p className="text-xs text-text-muted">
+                    Extract text and property details entirely on this device using in-browser recognition.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 self-start sm:self-auto">
+                <span className="px-2 py-0.5 text-[10px] font-bold tracking-wider bg-emerald-50 text-emerald-800 border border-emerald-200 rounded uppercase">
+                  100% On-Device
+                </span>
+                <span className="px-2 py-0.5 text-[10px] font-bold tracking-wider bg-stone-100 text-stone-700 border border-border rounded uppercase">
+                  Zero Cloud Upload
+                </span>
+              </div>
+            </div>
+
+            {/* Language Selection & Action Row */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3.5 pt-1">
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-semibold text-text-primary whitespace-nowrap">
+                  Document Language:
+                </label>
+                <select
+                  value={ocrLanguage}
+                  onChange={(e) => setOcrLanguage(e.target.value)}
+                  disabled={isOcrRunning}
+                  className="px-2.5 py-1.5 text-xs bg-white border border-border rounded-lg text-text-primary focus:outline-none focus:border-green-dark"
+                >
+                  <option value="eng">English (Fastest / Default)</option>
+                  <option value="eng+tam">English + Tamil (Bilingual Deeds)</option>
+                  <option value="tam">Tamil (தமிழ் ஆவணங்கள்)</option>
+                </select>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {isOcrRunning ? (
+                  <button
+                    type="button"
+                    onClick={handleCancelOcr}
+                    className="px-3.5 py-1.5 bg-red-50 text-red-700 border border-red-200 text-xs font-medium rounded-lg hover:bg-red-100 transition-colors"
+                  >
+                    Cancel OCR
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleRunOcr}
+                    className="px-4 py-2 bg-green-dark hover:bg-[#134e3b] text-white text-xs font-semibold rounded-lg transition-colors shadow-xs flex items-center gap-1.5"
+                  >
+                    <svg className="w-3.5 h-3.5 text-emerald-300" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" />
+                    </svg>
+                    <span>{ocrResult ? 'Re-extract Text' : 'Extract Text & Details'}</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Progress Bar during active OCR */}
+            {isOcrRunning && (
+              <div className="bg-white border border-border rounded-lg p-3.5 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium text-text-primary flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
+                    {ocrProgress.message || 'Extracting text...'}
+                  </span>
+                  <span className="font-mono text-emerald-700 font-bold">{ocrProgress.percent}%</span>
+                </div>
+                <div className="w-full bg-stone-100 rounded-full h-2 overflow-hidden border border-border/50">
+                  <div
+                    className="bg-green-dark h-full transition-all duration-300 rounded-full"
+                    style={{ width: `${Math.max(5, ocrProgress.percent)}%` }}
+                  />
+                </div>
+                <p className="text-[11px] text-text-muted">
+                  Processing locally on your device. Canvases and workers are created and released cleanly.
+                </p>
+              </div>
+            )}
+
+            {/* OCR Error Box */}
+            {ocrError && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-900 space-y-2">
+                <div className="flex items-start gap-2">
+                  <svg className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+                  </svg>
+                  <p className="leading-relaxed">{ocrError}</p>
+                </div>
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleRunOcr}
+                    className="px-3 py-1 bg-amber-200 hover:bg-amber-300 text-amber-950 font-medium rounded transition-colors text-xs"
+                  >
+                    Retry OCR
+                  </button>
+                  <span className="text-[11px] text-amber-800">
+                    You can also proceed with manual entry in the fields below.
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* OCR Success Summary */}
+            {ocrResult && !isOcrRunning && (
+              <div className="bg-white border border-emerald-200 rounded-lg p-3.5 space-y-2.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="w-5 h-5 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-xs font-bold">
+                      ✓
+                    </span>
+                    <span className="text-xs font-semibold text-emerald-900">
+                      {ocrResult.isDigitalPdf
+                        ? `Digital PDF Text Extracted (${ocrResult.totalPages} pages)`
+                        : `Character Recognition Complete (${ocrResult.language.toUpperCase()})`}
+                    </span>
+                    <span className="text-[11px] text-text-muted">
+                      • {ocrResult.matchedCount} suggestion(s) populated below
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsRawTextExpanded(!isRawTextExpanded)}
+                      className="text-xs font-medium text-green-dark hover:underline flex items-center gap-1"
+                    >
+                      <span>{isRawTextExpanded ? 'Hide Raw OCR Text' : 'Inspect Raw OCR Text'}</span>
+                      <span>{isRawTextExpanded ? '▴' : '▾'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Extracted suggestion chips */}
+                <div className="flex flex-wrap gap-1.5 pt-1 text-[11px]">
+                  {ocrResult.suggestions.documentType && (
+                    <span className="px-2 py-0.5 bg-stone-100 border border-border rounded text-stone-700">
+                      <strong>Category:</strong> {ocrResult.suggestions.documentType}
+                    </span>
+                  )}
+                  {ocrResult.suggestions.surveyNumber && (
+                    <span className="px-2 py-0.5 bg-stone-100 border border-border rounded text-stone-700">
+                      <strong>Survey:</strong> {ocrResult.suggestions.surveyNumber}
+                    </span>
+                  )}
+                  {ocrResult.suggestions.pattaNumber && (
+                    <span className="px-2 py-0.5 bg-stone-100 border border-border rounded text-stone-700">
+                      <strong>Patta:</strong> {ocrResult.suggestions.pattaNumber}
+                    </span>
+                  )}
+                  {ocrResult.suggestions.documentNumber && (
+                    <span className="px-2 py-0.5 bg-stone-100 border border-border rounded text-stone-700">
+                      <strong>Doc #:</strong> {ocrResult.suggestions.documentNumber}
+                    </span>
+                  )}
+                  {ocrResult.suggestions.ownerName && (
+                    <span className="px-2 py-0.5 bg-stone-100 border border-border rounded text-stone-700">
+                      <strong>Owner:</strong> {ocrResult.suggestions.ownerName}
+                    </span>
+                  )}
+                </div>
+
+                {/* Expandable Raw Text Box */}
+                {isRawTextExpanded && (
+                  <div className="mt-2 pt-2 border-t border-border space-y-2">
+                    <div className="flex items-center justify-between text-[11px] text-text-muted">
+                      <span>Recognized raw text ({ocrResult.rawText?.length || 0} characters):</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard?.writeText(ocrResult.rawText);
+                          setCopiedRawText(true);
+                          setTimeout(() => setCopiedRawText(false), 2000);
+                        }}
+                        className="text-green-dark hover:underline font-medium"
+                      >
+                        {copiedRawText ? '✓ Copied' : 'Copy Text'}
+                      </button>
+                    </div>
+                    <pre className="bg-stone-50 border border-border rounded-lg p-3 text-xs font-mono text-stone-800 max-h-48 overflow-y-auto whitespace-pre-wrap leading-relaxed select-all">
+                      {ocrResult.rawText || '(No text extracted)'}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Folio Metadata Form Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Column 1: Document Folio Details */}
@@ -697,14 +1047,24 @@ function AddDocumentContent() {
 
               {/* Document Name / Title */}
               <div>
-                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
-                  Document Title <span className="text-red-500">*</span>
+                <label className="flex items-center justify-between text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  <span>
+                    Document Title <span className="text-red-500">*</span>
+                  </span>
+                  {extractedFieldFlags.title && (
+                    <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 rounded tracking-normal normal-case">
+                      Extracted suggestion
+                    </span>
+                  )}
                 </label>
                 <input
                   type="text"
                   required
                   value={docName}
-                  onChange={(e) => setDocName(e.target.value)}
+                  onChange={(e) => {
+                    setDocName(e.target.value);
+                    setExtractedFieldFlags((prev) => ({ ...prev, title: false }));
+                  }}
                   placeholder="e.g. Registered Sale Deed, Patta Extract"
                   className="w-full px-3.5 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark focus:ring-1 focus:ring-green-dark"
                 />
@@ -712,12 +1072,22 @@ function AddDocumentContent() {
 
               {/* Document Type Category */}
               <div>
-                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
-                  Document Category <span className="text-red-500">*</span>
+                <label className="flex items-center justify-between text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  <span>
+                    Document Category <span className="text-red-500">*</span>
+                  </span>
+                  {extractedFieldFlags.type && (
+                    <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 rounded tracking-normal normal-case">
+                      Extracted suggestion
+                    </span>
+                  )}
                 </label>
                 <select
                   value={docType}
-                  onChange={(e) => setDocType(e.target.value)}
+                  onChange={(e) => {
+                    setDocType(e.target.value);
+                    setExtractedFieldFlags((prev) => ({ ...prev, type: false }));
+                  }}
                   className="w-full px-3 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
                 >
                   <option value="Registered Sale Deed">Registered Sale Deed</option>
@@ -734,13 +1104,23 @@ function AddDocumentContent() {
 
               {/* Document Registration Number */}
               <div>
-                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
-                  Document Number <span className="text-text-muted font-normal lowercase">(optional)</span>
+                <label className="flex items-center justify-between text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  <span>
+                    Document Number <span className="text-text-muted font-normal lowercase">(optional)</span>
+                  </span>
+                  {extractedFieldFlags.docNumber && (
+                    <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 rounded tracking-normal normal-case">
+                      Extracted suggestion
+                    </span>
+                  )}
                 </label>
                 <input
                   type="text"
                   value={docNumber}
-                  onChange={(e) => setDocNumber(e.target.value)}
+                  onChange={(e) => {
+                    setDocNumber(e.target.value);
+                    setExtractedFieldFlags((prev) => ({ ...prev, docNumber: false }));
+                  }}
                   placeholder="e.g. Doc No. 412/1998, TR-8829"
                   className="w-full px-3.5 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
                 />
@@ -755,13 +1135,23 @@ function AddDocumentContent() {
 
               {/* Survey Number */}
               <div>
-                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
-                  Survey Number / Sub-division <span className="text-text-muted font-normal lowercase">(optional)</span>
+                <label className="flex items-center justify-between text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  <span>
+                    Survey Number / Sub-division <span className="text-text-muted font-normal lowercase">(optional)</span>
+                  </span>
+                  {extractedFieldFlags.survey && (
+                    <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 rounded tracking-normal normal-case">
+                      Extracted suggestion
+                    </span>
+                  )}
                 </label>
                 <input
                   type="text"
                   value={surveyNumber}
-                  onChange={(e) => setSurveyNumber(e.target.value)}
+                  onChange={(e) => {
+                    setSurveyNumber(e.target.value);
+                    setExtractedFieldFlags((prev) => ({ ...prev, survey: false }));
+                  }}
                   placeholder="e.g. 101/2A, 55/1"
                   className="w-full px-3.5 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
                 />
@@ -769,13 +1159,23 @@ function AddDocumentContent() {
 
               {/* Notes */}
               <div>
-                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
-                  Archival Notes & Safekeeping <span className="text-text-muted font-normal lowercase">(optional)</span>
+                <label className="flex items-center justify-between text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  <span>
+                    Archival Notes & Safekeeping <span className="text-text-muted font-normal lowercase">(optional)</span>
+                  </span>
+                  {extractedFieldFlags.notes && (
+                    <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 rounded tracking-normal normal-case">
+                      Extracted suggestion
+                    </span>
+                  )}
                 </label>
                 <textarea
                   rows={2}
                   value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
+                  onChange={(e) => {
+                    setNotes(e.target.value);
+                    setExtractedFieldFlags((prev) => ({ ...prev, notes: false }));
+                  }}
                   placeholder="e.g. Preserved in Canara Bank Safe Locker #418, original stamp papers"
                   className="w-full px-3.5 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
                 />
@@ -812,32 +1212,45 @@ function AddDocumentContent() {
           </div>
 
           {/* Action Buttons */}
-          <div className="flex flex-col sm:flex-row items-center justify-end gap-3 pt-2">
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
             <Link
               href={selectedProperty ? `/properties/${selectedProperty.id}` : '/documents'}
               className="w-full sm:w-auto px-5 py-2.5 text-center text-xs sm:text-sm font-medium text-text-primary bg-white border border-border rounded-lg hover:bg-stone-50 transition-colors"
             >
               Cancel
             </Link>
-            <button
-              type="submit"
-              disabled={isSubmitting || saveSuccess}
-              className="w-full sm:w-auto px-7 py-2.5 bg-green-dark text-white text-xs sm:text-sm font-semibold rounded-lg hover:bg-[#134e3b] active:scale-[0.99] transition-all shadow-xs disabled:opacity-50 flex items-center justify-center gap-2"
-            >
-              {isSubmitting ? (
-                <>
-                  <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
-                  </svg>
-                  <span>Saving to Vault...</span>
-                </>
-              ) : saveSuccess ? (
-                <span>✓ Document Saved</span>
-              ) : (
-                <span>Save Document to Vault →</span>
-              )}
-            </button>
+
+            <div className="flex flex-col sm:flex-row items-center gap-2.5 w-full sm:w-auto">
+              <button
+                type="button"
+                onClick={handleProceedToReview}
+                disabled={isNavigatingReview || isSubmitting}
+                className="w-full sm:w-auto px-5 py-2.5 bg-white border border-green-dark text-green-dark hover:bg-emerald-50 text-xs sm:text-sm font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5"
+              >
+                <span>Review Extracted Details (Split View)</span>
+                <span>→</span>
+              </button>
+
+              <button
+                type="submit"
+                disabled={isSubmitting || saveSuccess}
+                className="w-full sm:w-auto px-7 py-2.5 bg-green-dark text-white text-xs sm:text-sm font-semibold rounded-lg hover:bg-[#134e3b] active:scale-[0.99] transition-all shadow-xs disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {isSubmitting ? (
+                  <>
+                    <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                    </svg>
+                    <span>Saving to Vault...</span>
+                  </>
+                ) : saveSuccess ? (
+                  <span>✓ Document Saved</span>
+                ) : (
+                  <span>Save Document to Vault</span>
+                )}
+              </button>
+            </div>
           </div>
         </form>
       ) : (

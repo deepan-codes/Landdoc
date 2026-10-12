@@ -6,9 +6,9 @@ async function runTests() {
   // STEP 1: Verify SSR guard in non-browser environment
   console.log('\n[Test 1] Testing SSR guard behavior when window/indexedDB is undefined...');
   const { isIndexedDBSupported, getDB, closeDB } = await import('../lib/db.js');
-  
+
   assert.equal(isIndexedDBSupported(), false, 'isIndexedDBSupported() should return false in standard Node.js without browser globals');
-  
+
   let ssrErrorCaught = false;
   try {
     await getDB();
@@ -108,7 +108,7 @@ async function runTests() {
 
   // STEP 4: Document Operations with Sample Blob
   console.log('\n[Test 4] Testing Document CRUD operations and sample Blob storage...');
-  
+
   // Create sample binary Blobs
   const samplePdfContent = '%PDF-1.4 Mock Document Sample for LandDoc Testing %EOF';
   const samplePdfBlob = new Blob([samplePdfContent], { type: 'application/pdf' });
