@@ -1,8 +1,20 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import Link from 'next/link';
-import { documents as initialDocuments, properties } from '@/mockData';
+import { documents as initialDocuments, properties as mockProperties } from '@/mockData';
+import { getAllDocuments, getAllProperties } from '@/lib/db';
+
+function normalizeCategory(categoryOrType) {
+  const val = (categoryOrType || '').toLowerCase();
+  if (val.includes('patta') || val.includes('chitta')) return 'patta';
+  if (val.includes('sale') || val.includes('deed') || val.includes('conveyance')) return 'sale_deed';
+  if (val.includes('encumbrance') || val.includes('ec')) return 'encumbrance';
+  if (val.includes('tax') || val.includes('receipt') || val.includes('kist')) return 'tax_receipt';
+  if (val.includes('survey') || val.includes('fmb') || val.includes('sketch')) return 'survey';
+  if (val.includes('layout') || val.includes('plan')) return 'layout';
+  return 'other';
+}
 
 export default function DocumentsPage() {
   const [searchQuery, setSearchQuery] = useState('');
@@ -11,19 +23,78 @@ export default function DocumentsPage() {
   const [sortBy, setSortBy] = useState('recently_added'); // 'recently_added', 'oldest', 'name_asc'
   const [viewMode, setViewMode] = useState('list'); // 'list' | 'cards'
   const [visibleCount, setVisibleCount] = useState(8);
+  const [dbDocuments, setDbDocuments] = useState([]);
+  const [allProperties, setAllProperties] = useState(mockProperties);
+
+  useEffect(() => {
+    let isMounted = true;
+    async function loadData() {
+      try {
+        const [docs, props] = await Promise.all([
+          getAllDocuments(),
+          getAllProperties(),
+        ]);
+        if (isMounted) {
+          if (Array.isArray(docs)) setDbDocuments(docs);
+          if (Array.isArray(props)) {
+            const merged = [...props];
+            for (const p of mockProperties) {
+              if (!merged.some((mp) => mp.id === p.id)) {
+                merged.push(p);
+              }
+            }
+            setAllProperties(merged);
+          }
+        }
+      } catch (err) {
+        console.warn('Could not load documents/properties from IndexedDB:', err);
+      }
+    }
+    loadData();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Merged documents list combining IndexedDB records and initial mock data
+  const allDocuments = useMemo(() => {
+    const formattedDbDocs = dbDocuments.map((doc) => {
+      const prop = allProperties.find((p) => p.id === doc.propertyId);
+      const cat = normalizeCategory(doc.documentType || doc.category);
+      return {
+        ...doc,
+        id: doc.id,
+        name: doc.name || doc.title || doc.fileName || 'Untitled Document',
+        propertyName: doc.propertyName || prop?.name || 'Property',
+        propertyId: String(doc.propertyId),
+        category: cat,
+        type: doc.documentType || doc.type || 'Legal Document',
+        typeTag: doc.documentType || doc.type || 'Legal Document',
+        subtitle: doc.documentNumber || doc.reference || doc.notes || (doc.surveyNumber ? `Survey ${doc.surveyNumber}` : ''),
+        reference: doc.documentNumber || doc.reference || doc.notes || '',
+        surveyNumber: doc.surveyNumber || prop?.surveyNumber || '',
+        date: doc.dateAdded || (doc.createdAt ? new Date(doc.createdAt).toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' }) : 'Archived'),
+        dateAdded: doc.dateAdded || (doc.createdAt ? new Date(doc.createdAt).toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' }) : 'Archived'),
+        timestamp: doc.createdAt ? new Date(doc.createdAt).getTime() : Date.now(),
+        isAmber: Boolean(doc.isImportant),
+      };
+    });
+
+    return [...formattedDbDocs, ...initialDocuments];
+  }, [dbDocuments, allProperties]);
 
   // Dynamic Category Counts derived strictly from underlying data
   const categoryCounts = useMemo(() => {
     return {
-      all: initialDocuments.length,
-      patta: initialDocuments.filter((d) => d.category === 'patta').length,
-      sale_deed: initialDocuments.filter((d) => d.category === 'sale_deed').length,
-      encumbrance: initialDocuments.filter((d) => d.category === 'encumbrance').length,
-      tax_receipt: initialDocuments.filter((d) => d.category === 'tax_receipt').length,
-      survey: initialDocuments.filter((d) => d.category === 'survey').length,
-      layout: initialDocuments.filter((d) => d.category === 'layout').length,
+      all: allDocuments.length,
+      patta: allDocuments.filter((d) => d.category === 'patta').length,
+      sale_deed: allDocuments.filter((d) => d.category === 'sale_deed').length,
+      encumbrance: allDocuments.filter((d) => d.category === 'encumbrance').length,
+      tax_receipt: allDocuments.filter((d) => d.category === 'tax_receipt').length,
+      survey: allDocuments.filter((d) => d.category === 'survey').length,
+      layout: allDocuments.filter((d) => d.category === 'layout').length,
     };
-  }, []);
+  }, [allDocuments]);
 
   const categories = [
     { id: 'all', label: `All (${categoryCounts.all})` },
@@ -37,7 +108,7 @@ export default function DocumentsPage() {
 
   // Combined Search, Property Filter, Category Filter, and Sorting
   const filteredDocuments = useMemo(() => {
-    let result = [...initialDocuments];
+    let result = [...allDocuments];
 
     // 1. Property filter
     if (selectedProperty !== 'all') {
@@ -199,7 +270,7 @@ export default function DocumentsPage() {
             Documents
           </h1>
           <p className="text-sm text-text-muted mt-1.5">
-            All {initialDocuments.length} property documents stored locally across your {properties.length} properties.
+            All {allDocuments.length} property documents stored locally across your {allProperties.length} properties.
           </p>
         </div>
 
@@ -262,8 +333,8 @@ export default function DocumentsPage() {
                 onChange={(e) => setSelectedProperty(e.target.value)}
                 className="appearance-none bg-white border border-border rounded-lg pl-3 pr-8 py-2 text-xs sm:text-sm font-medium text-text-primary focus:outline-none focus:border-green-dark cursor-pointer transition-colors"
               >
-                <option value="all">All properties ({properties.length})</option>
-                {properties.map((p) => (
+                <option value="all">All properties ({allProperties.length})</option>
+                {allProperties.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
                   </option>

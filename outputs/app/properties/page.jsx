@@ -1,39 +1,116 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import Link from 'next/link';
-import { properties as initialProperties } from '@/mockData';
+import { getAllProperties, getAllDocuments } from '@/lib/db';
 
 export default function PropertiesPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState('recently-updated');
+  const [propertiesList, setPropertiesList] = useState([]);
+  const [docCounts, setDocCounts] = useState({});
+  const [isLoading, setIsLoading] = useState(true);
 
-  // Filter and sort properties
+  // Load saved properties and document counts from IndexedDB on client mount
+  useEffect(() => {
+    let isMounted = true;
+    async function loadProperties() {
+      try {
+        const [stored, docs] = await Promise.all([
+          getAllProperties(),
+          getAllDocuments().catch(() => []),
+        ]);
+        if (isMounted) {
+          // Sort newly created/updated properties first by default
+          const sortedStored = (stored || []).sort((a, b) => {
+            const timeA = new Date(a.updatedAt || a.createdAt || 0).getTime();
+            const timeB = new Date(b.updatedAt || b.createdAt || 0).getTime();
+            return timeB - timeA;
+          });
+          setPropertiesList(sortedStored);
+
+          // Calculate document counts per property
+          const counts = {};
+          if (Array.isArray(docs)) {
+            for (const d of docs) {
+              if (d.propertyId) {
+                counts[d.propertyId] = (counts[d.propertyId] || 0) + 1;
+              }
+            }
+          }
+          setDocCounts(counts);
+          setIsLoading(false);
+        }
+      } catch (err) {
+        console.error('Failed to load properties from IndexedDB:', err);
+        if (isMounted) {
+          setPropertiesList([]);
+          setIsLoading(false);
+        }
+      }
+    }
+    loadProperties();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Filter and sort actual saved properties from IndexedDB
   const filteredProperties = useMemo(() => {
-    let result = [...initialProperties];
+    let result = [...propertiesList];
 
-    // Search filter
+    // Search filter across all actual saved property attributes
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
       result = result.filter((p) => {
-        const nameMatch = p.name?.toLowerCase().includes(q);
-        const locMatch = p.location?.toLowerCase().includes(q);
-        const surveyMatch = p.surveyNumber?.toLowerCase().includes(q);
-        const pattaMatch = p.pattaNumber?.toLowerCase().includes(q);
-        const talukMatch = p.taluk?.toLowerCase().includes(q);
-        const extentMatch = p.extent?.toLowerCase().includes(q);
-        const subdivMatch = p.subdivisions?.some((sub) =>
-          sub.toLowerCase().includes(q)
-        );
+        const nameMatch = (p.name || '').toLowerCase().includes(q);
+        const locMatch = (p.location || '').toLowerCase().includes(q);
+        const ownerMatch = (p.owner || '').toLowerCase().includes(q);
+        const pattaMatch = (p.pattaNumber || '').toLowerCase().includes(q);
+        const surveyMatch = (p.surveyNumber || '').toLowerCase().includes(q);
+        const talukMatch = (p.taluk || '').toLowerCase().includes(q);
+        const extentMatch = (p.extent || '').toLowerCase().includes(q);
+        const notesMatch = (p.notes || '').toLowerCase().includes(q);
+        const categoryMatch = (p.category || '').toLowerCase().includes(q);
+        const idMatch = (p.id || '').toLowerCase().includes(q);
+        const refMatch = (p.refCode || '').toLowerCase().includes(q);
+
+        // Multiple survey numbers array
+        const surveyNumbersMatch =
+          Array.isArray(p.surveyNumbers) &&
+          p.surveyNumbers.some((num) => String(num).toLowerCase().includes(q));
+
+        // Subdivisions array
+        const subdivMatch =
+          Array.isArray(p.subdivisions) &&
+          p.subdivisions.some((sub) => String(sub).toLowerCase().includes(q));
+
+        // Rich surveys objects list
+        const surveysObjMatch =
+          Array.isArray(p.surveys) &&
+          p.surveys.some((s) => {
+            const numMatch = s?.number && String(s.number).toLowerCase().includes(q);
+            const subMatch =
+              Array.isArray(s?.subdivisions) &&
+              s.subdivisions.some((sub) => String(sub).toLowerCase().includes(q));
+            return numMatch || subMatch;
+          });
 
         return (
           nameMatch ||
           locMatch ||
-          surveyMatch ||
+          ownerMatch ||
           pattaMatch ||
+          surveyMatch ||
+          surveyNumbersMatch ||
+          subdivMatch ||
+          surveysObjMatch ||
           talukMatch ||
           extentMatch ||
-          subdivMatch
+          notesMatch ||
+          categoryMatch ||
+          idMatch ||
+          refMatch
         );
       });
     }
@@ -41,25 +118,34 @@ export default function PropertiesPage() {
     // Sorting
     switch (sortBy) {
       case 'name-asc':
-        result.sort((a, b) => a.name.localeCompare(b.name));
+        result.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
         break;
       case 'name-desc':
-        result.sort((a, b) => b.name.localeCompare(a.name));
+        result.sort((a, b) => (b.name || '').localeCompare(a.name || ''));
         break;
       case 'oldest-first':
-        result.sort((a, b) => (b.updatedDays || 0) - (a.updatedDays || 0));
+        result.sort((a, b) => {
+          const timeA = new Date(a.createdAt || a.updatedAt || 0).getTime() || 0;
+          const timeB = new Date(b.createdAt || b.updatedAt || 0).getTime() || 0;
+          return timeA - timeB;
+        });
         break;
       case 'most-documents':
-        result.sort((a, b) => (b.documents || 0) - (a.documents || 0));
+        result.sort((a, b) => (b.documents || b.addedDocuments || 0) - (a.documents || a.addedDocuments || 0));
         break;
       case 'recently-updated':
       default:
-        result.sort((a, b) => (a.updatedDays || 0) - (b.updatedDays || 0));
+        result.sort((a, b) => {
+          const timeA = new Date(a.updatedAt || a.createdAt || 0).getTime();
+          const timeB = new Date(b.updatedAt || b.createdAt || 0).getTime();
+          if (timeA && timeB && timeA !== timeB) return timeB - timeA;
+          return (a.updatedDays || 0) - (b.updatedDays || 0);
+        });
         break;
     }
 
     return result;
-  }, [searchQuery, sortBy]);
+  }, [propertiesList, searchQuery, sortBy]);
 
   return (
     <div className="space-y-6 sm:space-y-8">
@@ -70,9 +156,15 @@ export default function PropertiesPage() {
             My Properties
           </h1>
           <p className="text-sm text-text-muted mt-1.5">
-            {filteredProperties.length}{' '}
-            {filteredProperties.length === 1 ? 'family property' : 'family properties'}{' '}
-            registered in this local vault.
+            {isLoading ? (
+              'Accessing local encrypted database...'
+            ) : (
+              <>
+                {filteredProperties.length}{' '}
+                {filteredProperties.length === 1 ? 'family property' : 'family properties'}{' '}
+                registered in this local vault.
+              </>
+            )}
           </p>
         </div>
 
@@ -154,21 +246,43 @@ export default function PropertiesPage() {
         </div>
       </div>
 
-      {/* Property Cards List */}
-      {filteredProperties.length > 0 ? (
+      {/* Property Cards List / Loading State */}
+      {isLoading ? (
+        <div className="space-y-4">
+          {[1, 2].map((i) => (
+            <div
+              key={i}
+              className="bg-white border border-border rounded-xl p-5 flex flex-col md:flex-row items-stretch md:items-center gap-6 animate-pulse"
+            >
+              <div className="w-full md:w-44 h-36 md:h-28 rounded-lg bg-stone-100 flex-shrink-0" />
+              <div className="flex-1 space-y-3 py-1">
+                <div className="h-5 bg-stone-200 rounded w-1/3" />
+                <div className="h-4 bg-stone-100 rounded w-1/2" />
+                <div className="h-2 bg-stone-100 rounded w-full mt-4" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : filteredProperties.length > 0 ? (
         <div className="space-y-4">
           {filteredProperties.map((property) => {
-            const percentage = Math.round(
-              (property.addedDocuments / property.requiredDocuments) * 100
-            );
+            const reqTotal = property.requiredDocuments || 9;
+            const reqAdded = docCounts[property.id] !== undefined ? docCounts[property.id] : (property.addedDocuments || 0);
+            const percentage = Math.round((reqAdded / reqTotal) * 100);
 
             // Subtitle string with bullet dots
+            const displaySurvey = property.surveyNumber
+              ? `Survey No. ${property.surveyNumber}`
+              : property.surveyNumbers?.length
+              ? `Survey No. ${property.surveyNumbers.join(', ')}`
+              : null;
+
             const metaParts = [
               property.location,
-              `Survey No. ${property.surveyNumber}`,
+              displaySurvey,
               property.pattaNumber ? `Patta No. ${property.pattaNumber}` : null,
               property.extent ? property.extent : null,
-              `${property.documents} documents`,
+              `${docCounts[property.id] !== undefined ? docCounts[property.id] : (property.documents ?? reqAdded)} documents`,
             ].filter(Boolean);
 
             return (
@@ -181,7 +295,7 @@ export default function PropertiesPage() {
                   {/* Property Thumbnail */}
                   <div className="w-full md:w-44 h-36 md:h-28 rounded-lg overflow-hidden bg-stone-100 flex-shrink-0">
                     <img
-                      src={property.photo}
+                      src={property.photo || 'https://images.unsplash.com/photo-1500382017468-9049fed747ef?w=500&h=300&fit=crop'}
                       alt={property.name}
                       className="w-full h-full object-cover group-hover:scale-102 transition-transform duration-300"
                     />
@@ -202,7 +316,7 @@ export default function PropertiesPage() {
 
                       <div className="flex-shrink-0 sm:text-right">
                         <p className="text-xs text-text-muted">
-                          Updated {property.lastUpdated}
+                          Updated {property.lastUpdated || 'Just now'}
                         </p>
                         <span className="inline-flex items-center gap-1 text-xs sm:text-sm font-medium text-text-primary group-hover:text-green-dark mt-1 transition-colors">
                           <span>View property</span>
@@ -216,7 +330,7 @@ export default function PropertiesPage() {
                       <div className="flex items-center justify-between text-xs text-text-muted font-medium">
                         <span>Required records repository</span>
                         <span>
-                          {property.addedDocuments} of {property.requiredDocuments} added
+                          {reqAdded} of {reqTotal} added
                         </span>
                       </div>
                       <div className="w-full bg-[#E4E0D6] h-1.5 rounded-full mt-1.5 overflow-hidden">

@@ -1,26 +1,80 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import Link from 'next/link';
-import { notFound } from 'next/navigation';
 import { properties, documents } from '@/mockData';
+import { getProperty, getDocumentsByProperty } from '@/lib/db';
 
 export default function PropertyDetailPage({ params }) {
-  const property = properties.find((p) => p.id === params.id) || properties[0];
-
-  if (!property) {
-    notFound();
-  }
+  const [loadedProperty, setLoadedProperty] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [dbDocuments, setDbDocuments] = useState([]);
 
   // Filter state
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState('all'); // 'all', 'key', 'recent'
   const [visibleCount, setVisibleCount] = useState(8);
 
-  // All documents belonging to this property
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadData() {
+      setIsLoading(true);
+      const propId = params?.id;
+
+      if (!propId) {
+        if (isMounted) {
+          setLoadedProperty(null);
+          setIsLoading(false);
+        }
+        return;
+      }
+
+      try {
+        // 1. Load property from IndexedDB
+        const found = await getProperty(propId);
+        if (isMounted && found) {
+          setLoadedProperty(found);
+        } else if (isMounted) {
+          // Fall back to sample mock property only if it matches a predefined mock ID
+          const mockProp = properties.find((p) => p.id === propId);
+          setLoadedProperty(mockProp || null);
+        }
+
+        // 2. Load documents linked to this property from IndexedDB
+        const docs = await getDocumentsByProperty(propId);
+        if (isMounted && Array.isArray(docs)) {
+          setDbDocuments(docs);
+        }
+      } catch (err) {
+        console.error('Failed to load property data:', err);
+        if (isMounted) {
+          const mockProp = properties.find((p) => p.id === propId);
+          setLoadedProperty(mockProp || null);
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    loadData();
+    return () => {
+      isMounted = false;
+    };
+  }, [params?.id]);
+
+  const property = loadedProperty;
+
+  // All documents belonging to this property (combining local IndexedDB and sample data where appropriate)
   const propertyDocs = useMemo(() => {
-    return documents.filter((d) => d.propertyId === property.id);
-  }, [property.id]);
+    if (!property) return [];
+    // Only load sample mock documents for predefined sample properties
+    const isMock = properties.some((p) => p.id === property.id);
+    const mockDocs = isMock ? documents.filter((d) => d.propertyId === property.id) : [];
+    return [...dbDocuments, ...mockDocs];
+  }, [property, dbDocuments]);
 
   // Search and filter logic
   const filteredDocs = useMemo(() => {
@@ -28,18 +82,25 @@ export default function PropertyDetailPage({ params }) {
 
     // Filter type
     if (activeFilter === 'key') {
-      result = result.filter((d) => d.isKey);
+      result = result.filter((d) => Boolean(d.isKey || d.isImportant));
     } else if (activeFilter === 'recent') {
-      result = result.filter((d) => d.isRecent);
+      result = result.filter((d) => {
+        if (d.isRecent) return true;
+        if (d.createdAt) {
+          const diffDays = (Date.now() - new Date(d.createdAt).getTime()) / (1000 * 3600 * 24);
+          return diffDays <= 30;
+        }
+        return false;
+      });
     }
 
     // Search query
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
       result = result.filter((d) => {
-        const titleMatch = d.name.toLowerCase().includes(q);
-        const typeMatch = (d.type || '').toLowerCase().includes(q);
-        const refMatch = (d.reference || '').toLowerCase().includes(q);
+        const titleMatch = (d.name || d.title || d.metadata?.fileName || '').toLowerCase().includes(q);
+        const typeMatch = (d.type || d.documentType || '').toLowerCase().includes(q);
+        const refMatch = (d.reference || d.description || d.metadata?.reference || d.metadata?.notes || '').toLowerCase().includes(q);
         const surveyMatch = (d.surveyNumber || '').toLowerCase().includes(q);
         const subMatch = (d.subdivision || '').toLowerCase().includes(q);
         const pattaMatch = (d.pattaNumber || '').toLowerCase().includes(q);
@@ -51,13 +112,11 @@ export default function PropertyDetailPage({ params }) {
     return result;
   }, [propertyDocs, activeFilter, searchQuery]);
 
-  const displayedDocs = filteredDocs.slice(0, visibleCount);
-  const remainingCount = filteredDocs.length - displayedDocs.length;
+  const displayedDocs = useMemo(() => {
+    return filteredDocs.slice(0, visibleCount);
+  }, [filteredDocs, visibleCount]);
 
-  // Percentage for requisite records
-  const reqAdded = property.addedDocuments || 7;
-  const reqTotal = property.requiredDocuments || 9;
-  const progressPct = Math.round((reqAdded / reqTotal) * 100);
+  const remainingCount = Math.max(0, filteredDocs.length - displayedDocs.length);
 
   // Render thumbnail icon based on code
   const renderThumbnailIcon = (code) => {
@@ -115,6 +174,48 @@ export default function PropertyDetailPage({ params }) {
     }
   };
 
+  // 1. Loading State
+  if (isLoading) {
+    return (
+      <div className="py-20 text-center max-w-md mx-auto">
+        <div className="w-9 h-9 border-2 border-green-dark border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+        <h2 className="font-serif text-xl text-text-primary font-normal">Loading property folio...</h2>
+        <p className="text-xs text-text-muted mt-1.5">Retrieving archival record from local storage</p>
+      </div>
+    );
+  }
+
+  // 2. Not-Found State for invalid or deleted property ID
+  if (!property) {
+    return (
+      <div className="bg-white border border-border rounded-xl p-8 sm:p-12 text-center max-w-md mx-auto my-12 shadow-xs">
+        <div className="w-12 h-12 bg-red-50 text-red-600 rounded-full flex items-center justify-center mx-auto mb-4">
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+          </svg>
+        </div>
+        <h1 className="text-2xl font-serif text-text-primary font-semibold mb-2">
+          Property not found
+        </h1>
+        <p className="text-sm text-text-muted mb-6 leading-relaxed">
+          The property ID <code className="px-1.5 py-0.5 bg-stone-100 rounded text-xs font-mono">{params?.id}</code> could not be found in your local vault. It may have been deleted or never created.
+        </p>
+        <Link
+          href="/properties"
+          className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-green-dark text-white rounded-lg text-sm font-semibold hover:bg-[#134e3b] transition-colors shadow-xs"
+        >
+          <span>←</span>
+          <span>Back to My Properties</span>
+        </Link>
+      </div>
+    );
+  }
+
+  // Derived progress values
+  const reqAdded = property.addedDocuments ?? propertyDocs.length;
+  const reqTotal = property.requiredDocuments || 9;
+  const progressPct = Math.min(100, Math.round((reqAdded / reqTotal) * 100));
+
   return (
     <div className="space-y-6 sm:space-y-8 pb-12">
       {/* 1. Breadcrumbs */}
@@ -123,19 +224,19 @@ export default function PropertyDetailPage({ params }) {
           Properties
         </Link>
         <span>/</span>
-        <span className="text-text-primary font-medium">{property.name}</span>
+        <span className="text-text-primary font-medium truncate max-w-xs">{property.name}</span>
       </nav>
 
       {/* 2. Property Header */}
       <div className="flex flex-col md:flex-row md:items-start justify-between gap-5">
-        <div className="space-y-2">
+        <div className="space-y-2 max-w-2xl">
           {/* Category Pill and Ref Code */}
           <div className="flex items-center gap-2">
             <span className="px-2.5 py-0.5 text-[11px] font-semibold bg-[#F9EED9] text-[#7A531A] rounded-md tracking-wider uppercase font-sans">
               {property.category || 'HERITAGE HOLDING'}
             </span>
             <span className="text-xs text-text-muted">
-              • {property.refCode || 'Ref: TN-AMB-1998-025'}
+              • {property.refCode || `ID: ${property.id}`}
             </span>
           </div>
 
@@ -145,28 +246,53 @@ export default function PropertyDetailPage({ params }) {
           </h1>
 
           {/* Location and Identifiers Line */}
-          <p className="text-xs sm:text-sm text-text-muted flex flex-wrap items-center gap-1.5">
-            <span>{property.location}</span>
-            <span>•</span>
-            <span>Survey No. {property.surveyNumber}</span>
+          <div className="text-xs sm:text-sm text-text-muted flex flex-wrap items-center gap-1.5 leading-relaxed">
+            {property.location && <span>{property.location}</span>}
+
+            {/* Survey Numbers (Primary and additional array) */}
+            {(property.surveyNumbers?.length > 0 || property.surveyNumber) && (
+              <>
+                <span>•</span>
+                <span>
+                  Survey No.{' '}
+                  {property.surveyNumbers && property.surveyNumbers.length > 0
+                    ? property.surveyNumbers.join(', ')
+                    : property.surveyNumber}
+                </span>
+              </>
+            )}
+
+            {/* Subdivisions */}
             {property.subdivisions && property.subdivisions.length > 0 && (
               <>
                 <span>(Sub: {property.subdivisions.join(', ')})</span>
               </>
             )}
+
+            {/* Patta Number */}
             {property.pattaNumber && (
               <>
                 <span>•</span>
                 <span>Patta No. {property.pattaNumber}</span>
               </>
             )}
+
+            {/* Owner Name */}
+            {property.owner && (
+              <>
+                <span>•</span>
+                <span className="font-medium text-text-primary">Owner: {property.owner}</span>
+              </>
+            )}
+
+            {/* Taluk */}
             {property.taluk && (
               <>
                 <span>•</span>
                 <span>{property.taluk}</span>
               </>
             )}
-          </p>
+          </div>
         </div>
 
         {/* Action Buttons */}
@@ -211,6 +337,33 @@ export default function PropertyDetailPage({ params }) {
         </div>
       </div>
 
+      {/* Custodial Lineage & Notes (Where available) */}
+      {property.notes && (
+        <div className="bg-[#FAF8F5] border border-border/80 rounded-xl p-4 sm:p-5 flex items-start gap-3.5 shadow-2xs">
+          <svg
+            className="w-5 h-5 text-[#8C5E28] flex-shrink-0 mt-0.5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"
+            />
+          </svg>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-xs sm:text-sm font-semibold text-text-primary tracking-tight">
+              Custodial Lineage & Storage Notes
+            </h2>
+            <p className="text-xs text-text-muted mt-1 leading-relaxed">
+              {property.notes}
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* 3. Summary Section (4-column card) */}
       <div className="bg-white border border-border rounded-xl p-5 sm:p-6 shadow-xs">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 divide-y sm:divide-y-0 lg:divide-x divide-border">
@@ -227,7 +380,7 @@ export default function PropertyDetailPage({ params }) {
             </div>
             <p className="text-xs text-text-muted mt-2 flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-text-muted/60 flex-shrink-0" />
-              <span>{property.archivalNote || 'Archival bond preservation'}</span>
+              <span>{property.archivalNote || (property.notes ? 'Custodial notes recorded' : 'Archival bond preservation')}</span>
             </p>
           </div>
 
@@ -250,7 +403,7 @@ export default function PropertyDetailPage({ params }) {
             </div>
             <p className="text-xs text-text-muted mt-2">
               {property.checklistNotAddedNote ||
-                `${reqTotal - reqAdded} not added: Encumbrance 2024 update, Chitta extract`}
+                (reqTotal > reqAdded ? `${reqTotal - reqAdded} records pending safekeeping` : 'All requisite records vaulted')}
             </p>
           </div>
 
@@ -260,10 +413,10 @@ export default function PropertyDetailPage({ params }) {
               REGISTRY ACTIVITY
             </span>
             <p className="font-serif text-lg font-bold text-text-primary mt-1">
-              Updated {property.lastUpdated || '2 days ago'}
+              {property.lastUpdated ? `Updated ${property.lastUpdated}` : 'Recently updated'}
             </p>
             <p className="text-xs text-text-muted mt-1.5">
-              {property.registryActivity?.note || 'Patta digital extract synced'}
+              {property.registryActivity?.note || 'Local cryptographic verification intact'}
             </p>
           </div>
 
@@ -286,10 +439,10 @@ export default function PropertyDetailPage({ params }) {
                   d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z"
                 />
               </svg>
-              <span>{property.physicalCustody?.locker || '1 deed in Canara Bank Safe Locker #418'}</span>
+              <span>{property.physicalCustody?.locker || (property.notes ? (property.notes.length > 35 ? `${property.notes.slice(0, 35)}...` : property.notes) : 'Device local vault')}</span>
             </div>
             <p className="text-xs text-text-muted mt-1.5">
-              {property.physicalCustody?.storage || '4 physical folios in domestic archive safe'}
+              {property.physicalCustody?.storage || 'Domestic archive custody'}
             </p>
           </div>
         </div>
@@ -369,74 +522,134 @@ export default function PropertyDetailPage({ params }) {
         </div>
       </div>
 
-      {/* 5. Document Cards Grid (2-column on desktop, 1-column on mobile) */}
+      {/* 5. Document Cards Grid */}
       {displayedDocs.length > 0 ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-5">
-          {displayedDocs.map((doc) => (
-            <div
-              key={doc.id}
-              className="bg-white border border-border rounded-xl p-4 sm:p-5 hover:border-stone-400 transition-colors shadow-xs flex flex-col justify-between group"
-            >
-              {/* Card Top: Thumbnail & Details */}
-              <div className="flex items-start gap-4">
-                {/* Styled Document Thumbnail Container */}
-                <div
-                  className={`w-12 h-14 bg-[#F8F6F0] rounded-lg border border-[#E4E0D6] flex flex-col items-center justify-between p-1.5 flex-shrink-0 ${
-                    doc.isAmber ? 'border-b-2 border-b-[#8C5E28]' : 'border-b-2 border-b-stone-400'
-                  }`}
-                >
-                  <div className="flex-1 flex items-center justify-center">
-                    {renderThumbnailIcon(doc.iconCode)}
-                  </div>
-                  <span className="text-[9px] font-bold tracking-wider font-mono text-stone-700 uppercase">
-                    {doc.iconCode || 'DOC'}
-                  </span>
-                </div>
+          {displayedDocs.map((doc) => {
+            const docType = doc.type || doc.documentType || 'Document';
+            const docTitle = doc.name || doc.metadata?.fileName || doc.title || 'Untitled Document';
+            const docRef = doc.reference || doc.description || doc.metadata?.reference || doc.metadata?.notes || '';
+            const docDate =
+              doc.dateAdded ||
+              (doc.createdAt
+                ? new Date(doc.createdAt).toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' })
+                : doc.date
+                ? `Added ${doc.date}`
+                : 'Archived');
 
-                {/* Content */}
-                <div className="min-w-0 flex-1 space-y-1">
-                  {/* Category Pill */}
-                  <div>
-                    <span
-                      className={`inline-block px-2 py-0.5 text-[11px] font-medium rounded ${
-                        doc.isAmber
-                          ? 'bg-[#FDF6ED] text-[#8C5E28] border border-[#F3E2CF]'
-                          : 'bg-[#F2EFEB] text-text-primary border border-border/70'
-                      }`}
-                    >
-                      {doc.type}
+            const iconCode =
+              doc.iconCode ||
+              (docType.toLowerCase().includes('sale')
+                ? 'DEED'
+                : docType.toLowerCase().includes('patta')
+                ? 'REV'
+                : docType.toLowerCase().includes('tax')
+                ? 'TAX'
+                : docType.toLowerCase().includes('encumbrance')
+                ? 'ENC'
+                : docType.toLowerCase().includes('fmb')
+                ? 'FMB'
+                : 'DOC');
+
+            const isAmber = doc.isAmber ?? (iconCode === 'DEED' || doc.isImportant);
+
+            return (
+              <div
+                key={doc.id}
+                className="bg-white border border-border rounded-xl p-4 sm:p-5 hover:border-stone-400 transition-colors shadow-xs flex flex-col justify-between group"
+              >
+                {/* Card Top: Thumbnail & Details */}
+                <div className="flex items-start gap-4">
+                  {/* Styled Document Thumbnail Container */}
+                  <div
+                    className={`w-12 h-14 bg-[#F8F6F0] rounded-lg border border-[#E4E0D6] flex flex-col items-center justify-between p-1.5 flex-shrink-0 ${
+                      isAmber ? 'border-b-2 border-b-[#8C5E28]' : 'border-b-2 border-b-stone-400'
+                    }`}
+                  >
+                    <div className="flex-1 flex items-center justify-center">
+                      {renderThumbnailIcon(iconCode)}
+                    </div>
+                    <span className="text-[9px] font-bold tracking-wider font-mono text-stone-700 uppercase">
+                      {iconCode}
                     </span>
                   </div>
 
-                  {/* Title */}
-                  <h3 className="font-serif font-bold text-base text-text-primary group-hover:text-green-dark transition-colors truncate">
-                    {doc.name}
-                  </h3>
+                  {/* Content */}
+                  <div className="min-w-0 flex-1 space-y-1">
+                    {/* Category Pill */}
+                    <div>
+                      <span
+                        className={`inline-block px-2 py-0.5 text-[11px] font-medium rounded ${
+                          isAmber
+                            ? 'bg-[#FDF6ED] text-[#8C5E28] border border-[#F3E2CF]'
+                            : 'bg-[#F2EFEB] text-text-primary border border-border/70'
+                        }`}
+                      >
+                        {docType}
+                      </span>
+                    </div>
 
-                  {/* Reference & Identifiers */}
-                  <p className="text-xs text-text-muted truncate">
-                    {doc.reference || doc.description}
-                  </p>
+                    {/* Title */}
+                    <h3 className="font-serif font-bold text-base text-text-primary group-hover:text-green-dark transition-colors truncate">
+                      {docTitle}
+                    </h3>
+
+                    {/* Reference & Identifiers */}
+                    <p className="text-xs text-text-muted truncate">
+                      {docRef || 'Archived record'}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Card Bottom: Date Added & View Link */}
+                <div className="pt-3 mt-3 border-t border-border flex items-center justify-between text-xs">
+                  <span className="text-text-muted">
+                    {docDate}
+                  </span>
+                  <Link
+                    href={`/documents/${doc.id}`}
+                    className="font-medium text-text-primary group-hover:text-green-dark transition-colors flex items-center gap-1"
+                  >
+                    <span>View</span>
+                    <span>→</span>
+                  </Link>
                 </div>
               </div>
-
-              {/* Card Bottom: Date Added & View Link */}
-              <div className="pt-3 mt-3 border-t border-border flex items-center justify-between text-xs">
-                <span className="text-text-muted">
-                  {doc.dateAdded || `Added ${doc.date}`}
-                </span>
-                <Link
-                  href={`/documents/${doc.id}`}
-                  className="font-medium text-text-primary group-hover:text-green-dark transition-colors flex items-center gap-1"
-                >
-                  <span>View</span>
-                  <span>→</span>
-                </Link>
-              </div>
-            </div>
-          ))}
+            );
+          })}
+        </div>
+      ) : propertyDocs.length === 0 ? (
+        /* Empty State: Property with no documents */
+        <div className="bg-white border border-border rounded-xl p-8 sm:p-12 text-center space-y-3">
+          <div className="w-12 h-12 bg-stone-100 rounded-full flex items-center justify-center mx-auto mb-2 text-text-muted">
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"
+              />
+            </svg>
+          </div>
+          <h3 className="font-serif text-lg font-semibold text-text-primary">
+            No documents vaulted yet
+          </h3>
+          <p className="text-xs text-text-muted max-w-sm mx-auto leading-relaxed">
+            This land folio does not have any attached records yet. Add your sale deed, patta certificate, encumbrance certificate, or FMB sketch.
+          </p>
+          <div className="pt-2">
+            <Link
+              href={`/documents/add?propertyId=${property.id}`}
+              className="inline-flex items-center gap-1.5 px-4 py-2 bg-green-dark text-white rounded-lg text-xs font-semibold hover:bg-[#134e3b] transition-colors shadow-xs"
+            >
+              <svg className="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+              </svg>
+              <span>Add Document to this Property</span>
+            </Link>
+          </div>
         </div>
       ) : (
+        /* Empty State: Filter/search produced no match */
         <div className="bg-white border border-border rounded-xl p-10 text-center space-y-3">
           <p className="font-serif text-lg text-text-primary">No documents found matching your filter</p>
           <p className="text-xs text-text-muted max-w-sm mx-auto">

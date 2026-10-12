@@ -3,30 +3,41 @@
 import { Suspense, useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { properties } from '@/mockData';
+import { properties as mockProperties } from '@/mockData';
+import { getAllProperties, getProperty, addDocument } from '@/lib/db';
 
 function AddDocumentContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const propIdParam = searchParams ? searchParams.get('propertyId') : null;
 
-  // Selected property (auto-select if propertyId param present, otherwise require selection)
-  const [selectedProperty, setSelectedProperty] = useState(() => {
-    if (propIdParam) {
-      return properties.find((p) => p.id === propIdParam) || null;
-    }
-    return null;
-  });
-
+  // Property state
+  const [propertiesList, setPropertiesList] = useState(mockProperties);
+  const [selectedProperty, setSelectedProperty] = useState(null);
   const [isPropertyMenuOpen, setIsPropertyMenuOpen] = useState(false);
   const [isTipsExpanded, setIsTipsExpanded] = useState(false);
 
   // File state & validation
   const [selectedFile, setSelectedFile] = useState(null);
+  const [rawFile, setRawFile] = useState(null);
   const [filePreview, setFilePreview] = useState(null);
   const [fileError, setFileError] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
+  const previewUrlRef = useRef(null);
+
+  // Document metadata fields
+  const [docName, setDocName] = useState('');
+  const [docType, setDocType] = useState('Registered Sale Deed');
+  const [docNumber, setDocNumber] = useState('');
+  const [surveyNumber, setSurveyNumber] = useState('');
+  const [notes, setNotes] = useState('');
+  const [isImportant, setIsImportant] = useState(false);
+
+  // Submission & feedback state
+  const [formError, setFormError] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [saveSuccess, setSaveSuccess] = useState(false);
 
   // Camera scanner state
   const [isCameraActive, setIsCameraActive] = useState(false);
@@ -38,12 +49,58 @@ function AddDocumentContent() {
 
   const scanParam = searchParams ? searchParams.get('scan') : null;
 
-  // Keep selectedProperty in sync if query param changes
+  // Load properties from IndexedDB and preselect from query parameter
   useEffect(() => {
-    if (propIdParam) {
-      const match = properties.find((p) => p.id === propIdParam);
-      if (match) setSelectedProperty(match);
+    let isMounted = true;
+
+    async function loadProperties() {
+      try {
+        const stored = await getAllProperties();
+        if (!isMounted) return;
+
+        // Combine stored properties with mock properties (deduplicating by ID)
+        const merged = [...(stored || [])];
+        for (const p of mockProperties) {
+          if (!merged.some((m) => m.id === p.id)) {
+            merged.push(p);
+          }
+        }
+        setPropertiesList(merged);
+
+        if (propIdParam) {
+          // Preselect requested property
+          const match = merged.find((p) => p.id === propIdParam);
+          if (match) {
+            setSelectedProperty(match);
+            const initialSurvey = match.surveyNumber || (match.surveyNumbers && match.surveyNumbers[0]) || '';
+            setSurveyNumber((prev) => prev || initialSurvey);
+          } else {
+            // Try fetching directly if not in list
+            const fetched = await getProperty(propIdParam);
+            if (isMounted && fetched) {
+              setSelectedProperty(fetched);
+              const initialSurvey = fetched.surveyNumber || (fetched.surveyNumbers && fetched.surveyNumbers[0]) || '';
+              setSurveyNumber((prev) => prev || initialSurvey);
+            }
+          }
+        } else if (merged.length > 0) {
+          setSelectedProperty((prev) => prev || merged[0]);
+          const initialSurvey = merged[0].surveyNumber || (merged[0].surveyNumbers && merged[0].surveyNumbers[0]) || '';
+          setSurveyNumber((prev) => prev || initialSurvey);
+        }
+      } catch (err) {
+        console.warn('Failed to load properties from IndexedDB:', err);
+        if (isMounted && propIdParam) {
+          const match = mockProperties.find((p) => p.id === propIdParam);
+          if (match) setSelectedProperty(match);
+        }
+      }
     }
+
+    loadProperties();
+    return () => {
+      isMounted = false;
+    };
   }, [propIdParam]);
 
   // Auto-start camera if scan query param is present
@@ -53,18 +110,35 @@ function AddDocumentContent() {
     }
   }, [scanParam]);
 
-  // Clean up camera on unmount
+  // Clean up camera stream and object URLs on unmount
   useEffect(() => {
     return () => {
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       }
+      if (previewUrlRef.current) {
+        URL.revokeObjectURL(previewUrlRef.current);
+        previewUrlRef.current = null;
+      }
     };
   }, []);
 
-  // Validate and set file
+  // Update survey number when switching properties if field was blank or matched previous property
+  const handleSelectProperty = (prop) => {
+    setSelectedProperty(prop);
+    setIsPropertyMenuOpen(false);
+    if (prop) {
+      const propSurvey = prop.surveyNumber || (prop.surveyNumbers && prop.surveyNumbers[0]) || '';
+      if (!surveyNumber || propertiesList.some((p) => p.surveyNumber === surveyNumber)) {
+        setSurveyNumber(propSurvey);
+      }
+    }
+  };
+
+  // Validate and process selected file
   const handleProcessFile = (file) => {
     setFileError(null);
+    setFormError(null);
 
     if (!file) return;
 
@@ -75,14 +149,20 @@ function AddDocumentContent() {
       return;
     }
 
-    // Validate type (PDF, JPG, PNG)
+    // Validate type (PDF, JPG, JPEG, PNG)
     const validTypes = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
     const extension = file.name.split('.').pop()?.toLowerCase();
     const validExtensions = ['pdf', 'jpg', 'jpeg', 'png'];
 
     if (!validTypes.includes(file.type) && !validExtensions.includes(extension)) {
-      setFileError('Unsupported file type. Please upload a PDF, JPG, or PNG document.');
+      setFileError('Unsupported file type. Please upload a PDF, JPG, JPEG, or PNG document.');
       return;
+    }
+
+    // Revoke previous preview URL if any
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current);
+      previewUrlRef.current = null;
     }
 
     // Formatted size
@@ -97,12 +177,46 @@ function AddDocumentContent() {
       rawSize: file.size,
       type: file.type || (extension === 'pdf' ? 'application/pdf' : 'image/jpeg'),
     });
+    setRawFile(file);
 
-    // Create thumbnail preview if image
+    // Auto-suggest document name if empty
+    if (!docName.trim()) {
+      const baseName = file.name
+        .replace(/\.[^/.]+$/, '')
+        .replace(/[_-]+/g, ' ')
+        .trim();
+      if (baseName) {
+        setDocName(baseName.charAt(0).toUpperCase() + baseName.slice(1));
+      }
+    }
+
+    // Auto-suggest document category if filename has clear indicators
+    const lowerName = file.name.toLowerCase();
+    if (lowerName.includes('patta') || lowerName.includes('chitta')) {
+      setDocType('Patta / Chitta Extract');
+    } else if (lowerName.includes('encumbrance') || lowerName.includes('ec')) {
+      setDocType('Encumbrance Certificate (EC)');
+    } else if (lowerName.includes('tax') || lowerName.includes('kist')) {
+      setDocType('Property Tax Receipt');
+    } else if (lowerName.includes('fmb') || lowerName.includes('sketch')) {
+      setDocType('Field Measurement Book (FMB)');
+    } else if (lowerName.includes('sale') || lowerName.includes('deed')) {
+      setDocType('Registered Sale Deed');
+    } else if (lowerName.includes('layout') || lowerName.includes('plan')) {
+      setDocType('Layout Approval / Order');
+    }
+
+    // Create thumbnail preview for images
     if (file.type?.startsWith('image/') || ['jpg', 'jpeg', 'png'].includes(extension)) {
-      const reader = new FileReader();
-      reader.onload = (e) => setFilePreview(e.target.result);
-      reader.readAsDataURL(file);
+      try {
+        const objectUrl = URL.createObjectURL(file);
+        previewUrlRef.current = objectUrl;
+        setFilePreview(objectUrl);
+      } catch (err) {
+        const reader = new FileReader();
+        reader.onload = (e) => setFilePreview(e.target.result);
+        reader.readAsDataURL(file);
+      }
     } else {
       setFilePreview(null);
     }
@@ -127,7 +241,6 @@ function AddDocumentContent() {
     setCameraError(null);
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        // Fallback to mobile camera input
         cameraInputRef.current?.click();
         return;
       }
@@ -145,7 +258,6 @@ function AddDocumentContent() {
       }, 100);
     } catch (err) {
       console.warn('Camera access denied or unavailable:', err);
-      // Graceful fallback to file picker with capture attribute
       cameraInputRef.current?.click();
     }
   };
@@ -182,46 +294,87 @@ function AddDocumentContent() {
   };
 
   const handleRemoveFile = () => {
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current);
+      previewUrlRef.current = null;
+    }
     setSelectedFile(null);
+    setRawFile(null);
     setFilePreview(null);
     setFileError(null);
+    setFormError(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
     if (cameraInputRef.current) cameraInputRef.current.value = '';
   };
 
-  // Continue to Review navigation
-  const handleContinueToReview = () => {
-    if (!selectedFile) return;
+  // Save document to IndexedDB
+  const handleSaveDocument = async (e) => {
+    if (e) e.preventDefault();
+    setFormError(null);
+    setFileError(null);
 
-    if (!selectedProperty) {
-      setFileError('Please select a target property before proceeding.');
+    // 1. Validate file
+    if (!selectedFile || !rawFile) {
+      setFileError('Please select or scan a document file before saving.');
       return;
     }
 
-    // Save temporary upload info in sessionStorage for review page
-    try {
-      sessionStorage.setItem(
-        'landdoc_pending_doc',
-        JSON.stringify({
-          propertyId: selectedProperty.id,
-          propertyName: selectedProperty.name,
-          fileName: selectedFile.name,
-          fileSize: selectedFile.size,
-          fileType: selectedFile.type,
-          filePreview: filePreview,
-          surveyNumber: selectedProperty.surveyNumber,
-          pattaNumber: selectedProperty.pattaNumber,
-        })
-      );
-    } catch (err) {
-      console.warn('Storage quota notice:', err);
+    // 2. Validate property
+    if (!selectedProperty) {
+      setFormError('Please select a target property for this document.');
+      return;
     }
 
-    const reviewUrl = `/documents/review?propertyId=${selectedProperty.id}&fileName=${encodeURIComponent(
-      selectedFile.name
-    )}&fileSize=${encodeURIComponent(selectedFile.size)}`;
+    // 3. Validate required fields
+    if (!docName.trim()) {
+      setFormError('Please enter a document title or name.');
+      return;
+    }
 
-    router.push(reviewUrl);
+    // Prevent duplicate submissions
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+
+    try {
+      const newDocRecord = {
+        propertyId: String(selectedProperty.id),
+        propertyName: selectedProperty.name,
+        name: docName.trim(),
+        title: docName.trim(),
+        documentType: docType,
+        type: docType,
+        documentNumber: docNumber.trim(),
+        surveyNumber: surveyNumber.trim() || selectedProperty.surveyNumber || '',
+        notes: notes.trim(),
+        description: notes.trim(),
+        isImportant: Boolean(isImportant),
+        isKey: Boolean(isImportant),
+        fileBlob: rawFile, // Binary Blob / File preserved in IndexedDB
+        fileName: rawFile.name || selectedFile.name,
+        fileSize: selectedFile.size,
+        fileType: rawFile.type || selectedFile.type,
+        dateAdded: new Date().toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' }),
+      };
+
+      await addDocument(newDocRecord);
+
+      // Clean up preview object URL
+      if (previewUrlRef.current) {
+        URL.revokeObjectURL(previewUrlRef.current);
+        previewUrlRef.current = null;
+      }
+
+      setSaveSuccess(true);
+
+      // Smooth navigation after showing success state
+      setTimeout(() => {
+        router.push(`/properties/${selectedProperty.id}`);
+      }, 700);
+    } catch (err) {
+      console.error('Failed to save document to IndexedDB:', err);
+      setFormError(err.message || 'Failed to save document to vault. Please try again.');
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -240,7 +393,7 @@ function AddDocumentContent() {
         {selectedProperty ? `Add a document to ${selectedProperty.name}` : 'Add a document'}
       </h1>
       <p className="text-xs sm:text-sm text-text-muted mb-6 leading-relaxed">
-        File an archival deed, revenue extract, or official receipt into the repository ledger.
+        File an archival deed, revenue extract, or official receipt into your encrypted local vault.
       </p>
 
       {/* 3. Property Selection Banner Card */}
@@ -253,11 +406,11 @@ function AddDocumentContent() {
           </div>
           <div className="min-w-0">
             <h2 className="font-semibold text-text-primary text-sm sm:text-base leading-tight truncate">
-              {selectedProperty ? selectedProperty.name : 'Select a property'}
+              {selectedProperty ? selectedProperty.name : 'Select a target property'}
             </h2>
             <p className="text-xs text-text-muted mt-0.5 truncate">
               {selectedProperty
-                ? `Survey No. ${selectedProperty.surveyNumber} • Patta No. ${selectedProperty.pattaNumber || '1845'} • ${selectedProperty.documents || 12} documents registered`
+                ? `Survey No. ${selectedProperty.surveyNumber || selectedProperty.surveyNumbers?.[0] || 'N/A'} • ${selectedProperty.location}`
                 : 'Choose which property this document belongs to before continuing'}
             </p>
           </div>
@@ -280,18 +433,15 @@ function AddDocumentContent() {
 
           {/* Property Dropdown Menu */}
           {isPropertyMenuOpen && (
-            <div className="absolute right-0 top-full mt-2 w-72 bg-white border border-border rounded-xl shadow-lg z-30 py-2 divide-y divide-border">
+            <div className="absolute right-0 top-full mt-2 w-72 bg-white border border-border rounded-xl shadow-lg z-30 py-2 divide-y divide-border max-h-80 overflow-y-auto">
               <div className="px-3.5 py-1.5 text-[11px] font-semibold text-text-muted uppercase tracking-wider">
                 Select Target Property
               </div>
-              {properties.map((p) => (
+              {propertiesList.map((p) => (
                 <button
                   key={p.id}
                   type="button"
-                  onClick={() => {
-                    setSelectedProperty(p);
-                    setIsPropertyMenuOpen(false);
-                  }}
+                  onClick={() => handleSelectProperty(p)}
                   className={`w-full text-left px-3.5 py-2.5 text-xs transition-colors flex items-center justify-between ${
                     selectedProperty?.id === p.id
                       ? 'bg-[#FAF7F2] font-semibold text-green-dark'
@@ -301,7 +451,7 @@ function AddDocumentContent() {
                   <div className="min-w-0 pr-2">
                     <p className="font-medium text-sm text-text-primary truncate">{p.name}</p>
                     <p className="text-[11px] text-text-muted mt-0.5 truncate">
-                      Survey #{p.surveyNumber} • {p.location}
+                      {p.surveyNumber ? `Survey #${p.surveyNumber}` : p.location}
                     </p>
                   </div>
                   {selectedProperty?.id === p.id && (
@@ -313,6 +463,41 @@ function AddDocumentContent() {
           )}
         </div>
       </div>
+
+      {/* Success Notification Alert */}
+      {saveSuccess && (
+        <div className="bg-emerald-50 border border-emerald-300 text-emerald-900 rounded-xl p-4 mb-6 text-sm flex items-center gap-3 shadow-xs animate-in fade-in">
+          <svg className="w-5 h-5 text-emerald-600 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          <div className="flex-1">
+            <p className="font-semibold">Document saved successfully!</p>
+            <p className="text-xs text-emerald-800 mt-0.5">Stored as an encrypted binary blob in your local vault. Redirecting...</p>
+          </div>
+        </div>
+      )}
+
+      {/* Error Alert Message */}
+      {(fileError || formError) && (
+        <div className="bg-red-50 border border-red-200 text-red-800 rounded-xl p-3.5 mb-5 text-xs flex items-center justify-between shadow-xs">
+          <div className="flex items-center gap-2">
+            <svg className="w-4 h-4 text-red-600 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+            </svg>
+            <span>{fileError || formError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setFileError(null);
+              setFormError(null);
+            }}
+            className="text-red-600 hover:text-red-900 font-bold ml-2"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Camera Live Viewfinder Modal */}
       {isCameraActive && (
@@ -365,105 +550,89 @@ function AddDocumentContent() {
         </div>
       )}
 
-      {/* Error Alert Message */}
-      {fileError && (
-        <div className="bg-red-50 border border-red-200 text-red-800 rounded-xl p-3.5 mb-5 text-xs flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <svg className="w-4 h-4 text-red-600 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-            </svg>
-            <span>{fileError}</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => setFileError(null)}
-            className="text-red-600 hover:text-red-900 font-bold ml-2"
-          >
-            ✕
-          </button>
-        </div>
-      )}
-
-      {/* 4. Selected File Preview & Review Action Card */}
+      {/* 4. Selected File & Metadata Entry Form */}
       {selectedFile ? (
-        <div className="bg-white border border-border rounded-xl p-6 shadow-xs mb-6 space-y-5">
-          <div className="flex items-center justify-between border-b border-border pb-4">
-            <div className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
-              <h2 className="font-serif font-bold text-base text-text-primary">
-                Selected Document File
-              </h2>
+        <form onSubmit={handleSaveDocument} className="space-y-6">
+          {/* File Card with Inspect & Replace */}
+          <div className="bg-white border border-border rounded-xl p-5 sm:p-6 shadow-xs space-y-4">
+            <div className="flex items-center justify-between border-b border-border pb-3">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
+                <h2 className="font-serif font-bold text-base text-text-primary">
+                  Attached File
+                </h2>
+              </div>
+              <span className="text-xs text-emerald-800 font-medium bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full">
+                Ready to Save
+              </span>
             </div>
-            <span className="text-xs text-emerald-800 font-medium bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full">
-              Ready for Review
-            </span>
-          </div>
 
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 bg-[#FAF9F5] border border-border rounded-xl">
-            <div className="flex items-center gap-3.5 min-w-0">
-              {filePreview ? (
-                <button
-                  type="button"
-                  onClick={() => setIsPreviewModalOpen(true)}
-                  className="group relative w-14 h-16 rounded-lg overflow-hidden bg-stone-200 border border-border flex-shrink-0 cursor-pointer focus:outline-none focus:ring-2 focus:ring-green-dark"
-                  title="Click to inspect full image"
-                >
-                  <img src={filePreview} alt="Preview" className="w-full h-full object-cover transition-transform group-hover:scale-105" />
-                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607zM10.5 7.5v6m3-3h-6" />
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 bg-[#FAF9F5] border border-border rounded-xl">
+              <div className="flex items-center gap-3.5 min-w-0">
+                {filePreview ? (
+                  <button
+                    type="button"
+                    onClick={() => setIsPreviewModalOpen(true)}
+                    className="group relative w-14 h-16 rounded-lg overflow-hidden bg-stone-200 border border-border flex-shrink-0 cursor-pointer focus:outline-none focus:ring-2 focus:ring-green-dark"
+                    title="Click to inspect full image"
+                  >
+                    <img src={filePreview} alt="Preview" className="w-full h-full object-cover transition-transform group-hover:scale-105" />
+                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607zM10.5 7.5v6m3-3h-6" />
+                      </svg>
+                    </div>
+                  </button>
+                ) : (
+                  <div className="w-14 h-16 rounded-lg bg-[#EFECE6] border border-border flex flex-col items-center justify-center flex-shrink-0">
+                    <svg className="w-6 h-6 text-stone-600" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
                     </svg>
+                    <span className="text-[9px] font-bold font-mono text-stone-600 uppercase mt-0.5">
+                      PDF
+                    </span>
                   </div>
-                </button>
-              ) : (
-                <div className="w-14 h-16 rounded-lg bg-[#EFECE6] border border-border flex flex-col items-center justify-center flex-shrink-0">
-                  <svg className="w-6 h-6 text-stone-600" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-                  </svg>
-                  <span className="text-[9px] font-bold font-mono text-stone-600 uppercase mt-0.5">
-                    PDF
-                  </span>
-                </div>
-              )}
+                )}
 
-              <div className="min-w-0">
-                <p className="font-semibold text-text-primary text-sm truncate">{selectedFile.name}</p>
-                <div className="flex items-center gap-2 mt-0.5">
-                  <span className="text-xs text-text-muted">
-                    {selectedFile.size} • Destination: {selectedProperty?.name}
-                  </span>
-                  {filePreview && (
-                    <button
-                      type="button"
-                      onClick={() => setIsPreviewModalOpen(true)}
-                      className="text-[11px] text-green-dark hover:underline font-medium inline-flex items-center gap-1"
-                    >
-                      <span>Inspect scan</span>
-                      <span>↗</span>
-                    </button>
-                  )}
+                <div className="min-w-0">
+                  <p className="font-semibold text-text-primary text-sm truncate">{selectedFile.name}</p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-xs text-text-muted">
+                      {selectedFile.size} • Attached to {selectedProperty?.name}
+                    </span>
+                    {filePreview && (
+                      <button
+                        type="button"
+                        onClick={() => setIsPreviewModalOpen(true)}
+                        className="text-[11px] text-green-dark hover:underline font-medium inline-flex items-center gap-1"
+                      >
+                        <span>Inspect preview</span>
+                        <span>↗</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
 
-            {/* Remove / Replace Actions */}
-            <div className="flex items-center gap-2 self-end sm:self-auto flex-shrink-0">
-              <label className="text-xs font-medium text-text-primary hover:text-green-dark bg-white border border-border rounded-lg px-3 py-1.5 cursor-pointer hover:bg-stone-50 transition-colors">
-                Replace
-                <input
-                  type="file"
-                  onChange={handleFileInputChange}
-                  accept=".pdf,.jpg,.jpeg,.png"
-                  className="hidden"
-                />
-              </label>
-              <button
-                type="button"
-                onClick={handleRemoveFile}
-                className="text-xs font-medium text-red-600 hover:text-red-800 bg-white border border-red-200 rounded-lg px-3 py-1.5 hover:bg-red-50 transition-colors"
-              >
-                Remove
-              </button>
+              {/* Replace / Remove Actions */}
+              <div className="flex items-center gap-2 self-end sm:self-auto flex-shrink-0">
+                <label className="text-xs font-medium text-text-primary hover:text-green-dark bg-white border border-border rounded-lg px-3 py-1.5 cursor-pointer hover:bg-stone-50 transition-colors">
+                  Replace
+                  <input
+                    type="file"
+                    onChange={handleFileInputChange}
+                    accept=".pdf,.jpg,.jpeg,.png"
+                    className="hidden"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={handleRemoveFile}
+                  className="text-xs font-medium text-red-600 hover:text-red-800 bg-white border border-red-200 rounded-lg px-3 py-1.5 hover:bg-red-50 transition-colors"
+                >
+                  Remove
+                </button>
+              </div>
             </div>
           </div>
 
@@ -483,7 +652,7 @@ function AddDocumentContent() {
                       {selectedFile?.name || 'Document Scan Preview'}
                     </h3>
                     <p className="text-[11px] text-text-muted mt-0.5">
-                      {selectedFile?.size} • Tamil Nadu Document Schedule Inspection
+                      {selectedFile?.size} • Document Schedule Inspection
                     </p>
                   </div>
                   <button
@@ -505,7 +674,7 @@ function AddDocumentContent() {
                 </div>
 
                 <div className="flex items-center justify-between px-5 py-3 border-t border-border bg-white text-xs">
-                  <span className="text-text-muted">Check text legibility, survey numbers, and four corners.</span>
+                  <span className="text-text-muted">Check text legibility, seals, and survey numbers.</span>
                   <button
                     type="button"
                     onClick={() => setIsPreviewModalOpen(false)}
@@ -518,18 +687,159 @@ function AddDocumentContent() {
             </div>
           )}
 
-          {/* Continue to Review Primary Button */}
-          <div className="pt-2">
-            <button
-              type="button"
-              onClick={handleContinueToReview}
-              className="w-full py-3 px-6 bg-green-dark text-white text-sm sm:text-base font-semibold rounded-lg hover:bg-[#134e3b] active:scale-[0.99] transition-all shadow-xs flex items-center justify-center gap-2"
+          {/* Folio Metadata Form Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* Column 1: Document Folio Details */}
+            <div className="bg-white border border-border rounded-xl p-5 sm:p-6 space-y-4 shadow-xs">
+              <h2 className="font-serif font-bold text-base text-text-primary border-b border-border pb-3">
+                Folio & Classification
+              </h2>
+
+              {/* Document Name / Title */}
+              <div>
+                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  Document Title <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={docName}
+                  onChange={(e) => setDocName(e.target.value)}
+                  placeholder="e.g. Registered Sale Deed, Patta Extract"
+                  className="w-full px-3.5 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark focus:ring-1 focus:ring-green-dark"
+                />
+              </div>
+
+              {/* Document Type Category */}
+              <div>
+                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  Document Category <span className="text-red-500">*</span>
+                </label>
+                <select
+                  value={docType}
+                  onChange={(e) => setDocType(e.target.value)}
+                  className="w-full px-3 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                >
+                  <option value="Registered Sale Deed">Registered Sale Deed</option>
+                  <option value="Patta / Chitta Extract">Patta / Chitta Extract</option>
+                  <option value="Encumbrance Certificate (EC)">Encumbrance Certificate (EC)</option>
+                  <option value="Property Tax Receipt">Property Tax Receipt</option>
+                  <option value="Field Measurement Book (FMB)">Field Measurement Book (FMB)</option>
+                  <option value="Settlement / Partition Deed">Settlement / Partition Deed</option>
+                  <option value="Layout Approval / Order">Layout Approval / Order</option>
+                  <option value="Power of Attorney">Power of Attorney</option>
+                  <option value="Other Legal Document">Other Legal Document</option>
+                </select>
+              </div>
+
+              {/* Document Registration Number */}
+              <div>
+                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  Document Number <span className="text-text-muted font-normal lowercase">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={docNumber}
+                  onChange={(e) => setDocNumber(e.target.value)}
+                  placeholder="e.g. Doc No. 412/1998, TR-8829"
+                  className="w-full px-3.5 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                />
+              </div>
+            </div>
+
+            {/* Column 2: Parcel Association & Custody */}
+            <div className="bg-white border border-border rounded-xl p-5 sm:p-6 space-y-4 shadow-xs">
+              <h2 className="font-serif font-bold text-base text-text-primary border-b border-border pb-3">
+                Schedule & Safekeeping
+              </h2>
+
+              {/* Survey Number */}
+              <div>
+                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  Survey Number / Sub-division <span className="text-text-muted font-normal lowercase">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={surveyNumber}
+                  onChange={(e) => setSurveyNumber(e.target.value)}
+                  placeholder="e.g. 101/2A, 55/1"
+                  className="w-full px-3.5 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                />
+              </div>
+
+              {/* Notes */}
+              <div>
+                <label className="block text-xs font-semibold text-text-primary uppercase tracking-wider mb-1.5">
+                  Archival Notes & Safekeeping <span className="text-text-muted font-normal lowercase">(optional)</span>
+                </label>
+                <textarea
+                  rows={2}
+                  value={notes}
+                  onChange={(e) => setNotes(e.target.value)}
+                  placeholder="e.g. Preserved in Canara Bank Safe Locker #418, original stamp papers"
+                  className="w-full px-3.5 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
+                />
+              </div>
+
+              {/* Important Flag Toggle */}
+              <div className="pt-1">
+                <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={isImportant}
+                    onChange={(e) => setIsImportant(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 rounded border-border text-green-dark focus:ring-green-dark"
+                  />
+                  <div className="text-xs">
+                    <span className="font-semibold text-text-primary">Mark as Key Document</span>
+                    <p className="text-text-muted text-[11px] mt-0.5">
+                      Highlights this deed in the primary portfolio summary card.
+                    </p>
+                  </div>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          {/* Privacy Note */}
+          <div className="bg-[#FAF9F5] border border-border rounded-xl p-4 flex items-center gap-3">
+            <svg className="w-5 h-5 text-text-muted flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
+            </svg>
+            <p className="text-xs text-text-muted leading-relaxed">
+              Your file is stored as a binary Blob directly in this device&apos;s browser IndexedDB. No unencrypted files leave your device.
+            </p>
+          </div>
+
+          {/* Action Buttons */}
+          <div className="flex flex-col sm:flex-row items-center justify-end gap-3 pt-2">
+            <Link
+              href={selectedProperty ? `/properties/${selectedProperty.id}` : '/documents'}
+              className="w-full sm:w-auto px-5 py-2.5 text-center text-xs sm:text-sm font-medium text-text-primary bg-white border border-border rounded-lg hover:bg-stone-50 transition-colors"
             >
-              <span>Continue to Review</span>
-              <span>→</span>
+              Cancel
+            </Link>
+            <button
+              type="submit"
+              disabled={isSubmitting || saveSuccess}
+              className="w-full sm:w-auto px-7 py-2.5 bg-green-dark text-white text-xs sm:text-sm font-semibold rounded-lg hover:bg-[#134e3b] active:scale-[0.99] transition-all shadow-xs disabled:opacity-50 flex items-center justify-center gap-2"
+            >
+              {isSubmitting ? (
+                <>
+                  <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                  </svg>
+                  <span>Saving to Vault...</span>
+                </>
+              ) : saveSuccess ? (
+                <span>✓ Document Saved</span>
+              ) : (
+                <span>Save Document to Vault →</span>
+              )}
             </button>
           </div>
-        </div>
+        </form>
       ) : (
         /* 5. Initial Scan and Upload Options */
         <>
@@ -702,9 +1012,6 @@ function AddDocumentContent() {
 
       {/* 7. Bottom Navigation & Cancel */}
       <div className="text-center space-y-2 pt-1">
-        <p className="text-xs text-text-muted">
-          Next, you&apos;ll review the details we read before anything is saved.
-        </p>
         <div>
           <Link
             href={selectedProperty ? `/properties/${selectedProperty.id}` : '/documents'}

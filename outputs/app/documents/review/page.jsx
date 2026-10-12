@@ -3,7 +3,8 @@
 import { Suspense, useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { properties } from '@/mockData';
+import { properties as mockProperties } from '@/mockData';
+import { getProperty, addDocument } from '@/lib/db';
 
 function ReviewDocumentContent() {
   const router = useRouter();
@@ -13,19 +14,50 @@ function ReviewDocumentContent() {
   const fileNameParam = searchParams.get('fileName') || 'Document_Deed_Scan.pdf';
   const fileSizeParam = searchParams.get('fileSize') || '2.4 MB';
 
-  const property = properties.find((p) => p.id === propertyId) || properties[0];
+  const [property, setProperty] = useState(() => {
+    return mockProperties.find((p) => p.id === propertyId) || mockProperties[0];
+  });
 
   // Editable / verified extracted fields
   const [docTitle, setDocTitle] = useState('Registered Sale Deed (Conveyance)');
-  const [docCategory, setDocCategory] = useState('Sale Deed');
+  const [docCategory, setDocCategory] = useState('Registered Sale Deed');
   const [docNumber, setDocNumber] = useState('Doc No. 412/1998');
   const [sroOffice, setSroOffice] = useState('SRO Poonamallee');
   const [regDate, setRegDate] = useState('1998-06-12');
-  const [surveyDetail, setSurveyDetail] = useState(`Survey ${property.surveyNumber}, Sub-Div 25/1A`);
+  const [surveyDetail, setSurveyDetail] = useState('');
   const [extent, setExtent] = useState('1,200 sq.ft (1.1 Are)');
   const [consideration, setConsideration] = useState('₹1,85,000');
   const [physicalStorage, setPhysicalStorage] = useState('Canara Bank Safe Locker #418');
   const [isSaving, setIsSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState(null);
+
+  // Fetch target property from IndexedDB if available
+  useEffect(() => {
+    let isMounted = true;
+    async function loadProp() {
+      try {
+        const found = await getProperty(propertyId);
+        if (isMounted && found) {
+          setProperty(found);
+          setSurveyDetail(`Survey ${found.surveyNumber || found.surveyNumbers?.[0] || '101/2'}, Sub-Div 25/1A`);
+        } else if (isMounted) {
+          const fallback = mockProperties.find((p) => p.id === propertyId) || mockProperties[0];
+          setProperty(fallback);
+          setSurveyDetail(`Survey ${fallback.surveyNumber || '25/1'}, Sub-Div 25/1A`);
+        }
+      } catch (err) {
+        if (isMounted) {
+          const fallback = mockProperties.find((p) => p.id === propertyId) || mockProperties[0];
+          setProperty(fallback);
+          setSurveyDetail(`Survey ${fallback.surveyNumber || '25/1'}, Sub-Div 25/1A`);
+        }
+      }
+    }
+    loadProp();
+    return () => {
+      isMounted = false;
+    };
+  }, [propertyId]);
 
   // Restore session data if present
   useEffect(() => {
@@ -42,15 +74,44 @@ function ReviewDocumentContent() {
     }
   }, [fileNameParam]);
 
-  const handleSaveToVault = (e) => {
+  const handleSaveToVault = async (e) => {
     e.preventDefault();
+    if (isSaving) return;
     setIsSaving(true);
-    setTimeout(() => {
+    setErrorMsg(null);
+
+    try {
+      await addDocument({
+        propertyId: String(property.id),
+        propertyName: property.name,
+        name: docTitle,
+        title: docTitle,
+        documentType: docCategory,
+        type: docCategory,
+        documentNumber: docNumber,
+        surveyNumber: surveyDetail,
+        notes: [
+          sroOffice ? `SRO: ${sroOffice}` : null,
+          regDate ? `Reg Date: ${regDate}` : null,
+          extent ? `Extent: ${extent}` : null,
+          consideration ? `Consideration: ${consideration}` : null,
+          physicalStorage ? `Safekeeping: ${physicalStorage}` : null,
+        ].filter(Boolean).join(' • '),
+        fileName: fileNameParam,
+        fileSize: fileSizeParam,
+        fileType: fileNameParam.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg',
+      });
+
       try {
         sessionStorage.removeItem('landdoc_pending_doc');
       } catch (err) {}
+
       router.push(`/properties/${property.id}`);
-    }, 600);
+    } catch (err) {
+      console.error('Failed to save document:', err);
+      setErrorMsg(err.message || 'Failed to save document record.');
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -85,6 +146,12 @@ function ReviewDocumentContent() {
           Verify the parcel schedule and registration metadata before filing into your vault.
         </p>
       </div>
+
+      {errorMsg && (
+        <div className="bg-red-50 border border-red-200 text-red-800 rounded-xl p-3.5 mb-5 text-xs">
+          {errorMsg}
+        </div>
+      )}
 
       <form onSubmit={handleSaveToVault} className="space-y-6">
         {/* File Banner */}
@@ -142,12 +209,12 @@ function ReviewDocumentContent() {
                   onChange={(e) => setDocCategory(e.target.value)}
                   className="w-full px-3 py-2 text-sm bg-white border border-border rounded-lg focus:outline-none focus:border-green-dark"
                 >
-                  <option value="Sale Deed">Registered Sale Deed</option>
-                  <option value="Patta">Patta / Chitta Extract</option>
-                  <option value="EC">Encumbrance Certificate (EC)</option>
-                  <option value="Tax">Property Tax Receipt</option>
-                  <option value="FMB">Field Measurement Book (FMB)</option>
-                  <option value="Settlement">Settlement / Partition Deed</option>
+                  <option value="Registered Sale Deed">Registered Sale Deed</option>
+                  <option value="Patta / Chitta Extract">Patta / Chitta Extract</option>
+                  <option value="Encumbrance Certificate (EC)">Encumbrance Certificate (EC)</option>
+                  <option value="Property Tax Receipt">Property Tax Receipt</option>
+                  <option value="Field Measurement Book (FMB)">Field Measurement Book (FMB)</option>
+                  <option value="Settlement / Partition Deed">Settlement / Partition Deed</option>
                 </select>
               </div>
 
@@ -258,7 +325,7 @@ function ReviewDocumentContent() {
             <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
           </svg>
           <p className="text-xs text-text-muted leading-relaxed">
-            Your document stays on this device. No unencrypted files or records are synchronized to external cloud databases.
+            Your document stays on this device. Stored into your secure local vault.
           </p>
         </div>
 

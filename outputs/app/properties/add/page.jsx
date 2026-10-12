@@ -1,9 +1,10 @@
 'use client';
 
-import { Suspense, useState, useEffect } from 'react';
+import { Suspense, useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { properties } from '@/mockData';
+import { addProperty, updateProperty, getProperty } from '@/lib/db';
 
 function AddPropertyForm() {
   const router = useRouter();
@@ -46,8 +47,45 @@ function AddPropertyForm() {
   const [inlineSubdivValue, setInlineSubdivValue] = useState('');
 
   // Validation / Feedback
+  const isSubmittingRef = useRef(false);
   const [errors, setErrors] = useState({});
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState(null);
   const [isSubmitted, setIsSubmitted] = useState(false);
+
+  // If editing an existing property from IndexedDB
+  useEffect(() => {
+    let isMounted = true;
+    if (editId && !existingProp) {
+      getProperty(editId)
+        .then((prop) => {
+          if (isMounted && prop) {
+            setPropertyName(prop.name || '');
+            setLocation(prop.location || '');
+            setOwnerName(prop.owner || '');
+            setPattaNumber(prop.pattaNumber || '');
+            setNotes(prop.notes || '');
+            if (prop.surveys && Array.isArray(prop.surveys) && prop.surveys.length > 0) {
+              setSurveys(prop.surveys);
+            } else if (prop.surveyNumbers && prop.surveyNumbers.length > 0) {
+              setSurveys(
+                prop.surveyNumbers.map((num, idx) => ({
+                  id: String(idx + 1),
+                  number: num,
+                  subdivisions: prop.subdivisions || [],
+                }))
+              );
+            }
+          }
+        })
+        .catch((err) => {
+          console.error('Error fetching property for edit:', err);
+        });
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [editId, existingProp]);
 
   // Remove entire survey number
   const handleRemoveSurvey = (id) => {
@@ -119,9 +157,16 @@ function AddPropertyForm() {
     setActiveSubdivSurveyId(null);
   };
 
-  // Save Property
-  const handleSubmit = (e) => {
+  // Save Property to IndexedDB with robust duplicate submission prevention
+  const handleSubmit = async (e) => {
     e.preventDefault();
+    // Synchronous ref check prevents duplicate submissions during fast clicks / Enter key spam
+    if (isSubmittingRef.current || isSaving || isSubmitted) {
+      return;
+    }
+    isSubmittingRef.current = true;
+
+    setSaveError(null);
     const newErrors = {};
 
     if (!propertyName.trim()) {
@@ -136,14 +181,64 @@ function AddPropertyForm() {
 
     if (Object.keys(newErrors).length > 0) {
       setErrors(newErrors);
+      isSubmittingRef.current = false; // Reset lock to allow correcting validation errors
       return;
     }
 
     setErrors({});
-    setIsSubmitted(true);
-    setTimeout(() => {
-      router.push(existingProp ? `/properties/${existingProp.id}` : '/properties');
-    }, 800);
+    setIsSaving(true);
+
+    try {
+      // Gather survey numbers and subdivisions
+      const surveyNumbersList = surveys
+        .map((s) => s.number.trim())
+        .filter(Boolean);
+
+      const allSubdivisions = [
+        ...new Set(
+          surveys.flatMap((s) => (Array.isArray(s.subdivisions) ? s.subdivisions : []))
+        ),
+      ];
+
+      const primarySurveyNumber = surveyNumbersList[0] || '';
+
+      const propertyPayload = {
+        name: propertyName.trim(),
+        location: location.trim(),
+        owner: ownerName.trim(),
+        pattaNumber: pattaNumber.trim(),
+        surveyNumber: primarySurveyNumber,
+        surveyNumbers: surveyNumbersList,
+        subdivisions: allSubdivisions,
+        surveys: surveys, // Rich survey and subdivision mapping
+        notes: notes.trim(),
+        category: existingProp?.category || 'HERITAGE HOLDING',
+        documents: existingProp?.documents || 0,
+        requiredDocuments: existingProp?.requiredDocuments || 9,
+        addedDocuments: existingProp?.addedDocuments || 0,
+        photo:
+          existingProp?.photo ||
+          'https://images.unsplash.com/photo-1500382017468-9049fed747ef?w=500&h=300&fit=crop',
+        lastUpdated: 'Just now',
+        updatedDays: 0,
+      };
+
+      const savedProp = editId
+        ? await updateProperty(editId, propertyPayload)
+        : await addProperty(propertyPayload);
+
+      setIsSubmitted(true);
+      setIsSaving(false);
+
+      // Navigate to existing My Properties page (or Property Details if editing)
+      const targetUrl = editId ? `/properties/${editId}` : '/properties';
+      router.push(targetUrl);
+    } catch (err) {
+      console.error('Failed to save property to IndexedDB:', err);
+      setSaveError(err.message || 'Failed to save property to local database.');
+      setIsSaving(false);
+      isSubmittingRef.current = false; // Reset lock on error to allow retry
+    }
   };
 
   return (
@@ -178,6 +273,18 @@ function AddPropertyForm() {
           : 'Create a private archival folder for a land parcel or family home.'}
       </p>
 
+      {/* Error Notification */}
+      {saveError && (
+        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl text-red-800 flex items-center gap-3">
+          <svg className="w-5 h-5 text-red-600 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+          </svg>
+          <span className="text-sm font-medium">
+            {saveError}
+          </span>
+        </div>
+      )}
+
       {/* Success Notification */}
       {isSubmitted && (
         <div className="mb-6 p-4 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 flex items-center gap-3">
@@ -185,14 +292,15 @@ function AddPropertyForm() {
             <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
           <span className="text-sm font-medium">
-            Property saved successfully! Redirecting to dashboard...
+            Property saved successfully to local database! Redirecting...
           </span>
         </div>
       )}
 
       {/* Main Form Card */}
       <form onSubmit={handleSubmit}>
-        <div className="bg-white border border-border rounded-xl p-5 sm:p-8 space-y-7 shadow-subtle">
+        <fieldset disabled={isSaving || isSubmitted} className="border-0 p-0 m-0">
+          <div className="bg-white border border-border rounded-xl p-5 sm:p-8 space-y-7 shadow-subtle">
           {/* 1. Basic Details */}
           <div className="space-y-4">
             {/* Property Name */}
@@ -579,12 +687,16 @@ function AddPropertyForm() {
 
             <button
               type="submit"
-              className="w-full sm:w-auto px-7 py-3 sm:py-2.5 bg-green-dark text-white text-sm font-medium rounded-lg hover:bg-[#134e3b] active:scale-[0.99] shadow-xs transition-all text-center"
+              disabled={isSaving || isSubmitted}
+              className={`w-full sm:w-auto px-7 py-3 sm:py-2.5 bg-green-dark text-white text-sm font-medium rounded-lg hover:bg-[#134e3b] active:scale-[0.99] shadow-xs transition-all text-center ${
+                isSaving || isSubmitted ? 'opacity-70 cursor-not-allowed pointer-events-none' : ''
+              }`}
             >
-              Save property
+              {isSaving ? 'Saving property...' : isSubmitted ? 'Saved' : 'Save property'}
             </button>
           </div>
         </div>
+        </fieldset>
       </form>
     </div>
   );
